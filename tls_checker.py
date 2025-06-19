@@ -47,27 +47,33 @@ def parse_args():
 
 def format_output(result: Dict, mode: str) -> str:
     """Format a single result dict according to the verbosity mode"""
-    host = result['host']
-    ip = result.get('ip', 'n/A')
-    rtt = f"{result['rtt_ms']}ms" if result.get('rtt_ms') is not None else 'n/A'
-    asn = result.get('asn', 'n/A')
-    name = result.get('asn_name', '')
-    cn = result.get('common_name', '')
+    host     = result['host']
+    ip       = result.get('ip', 'n/A')
+    rtt      = f"{result['rtt_ms']}ms" if result.get('rtt_ms') is not None else 'n/A'
+    asn      = result.get('asn', 'n/A')
+    name     = result.get('asn_name', '')
+    cn       = result.get('common_name', '')
     san_list = result.get('san_list', [])
+    error    = result.get('error', '')
+
+    # Choose prefix and, for failures, include the error code
+    prefix = "✅" if result.get('success') else "❌"
+    suffix = ""  if result.get('success') else f"  Error={error}"
 
     if mode == 'brief':
-        return f"✅ {host} – {ip} – {rtt} – ASN{asn} ({name})"
+        return f"{prefix} {host} – {ip} – {rtt} – ASN{asn} ({name}){suffix}"
 
     if mode == 'standard':
         san_preview = ', '.join(san_list[:3])
         if len(san_list) > 3:
             san_preview += ', ...'
         return (
-            f"✅ {host} – {ip} – {rtt} – CN={cn} – ASN{asn} ({name})\n"
+            f"{prefix} {host} – {ip} – {rtt} – CN={cn} – ASN{asn} ({name}){suffix}\n"
             f"    SANs: [{san_preview}]"
         )
 
-    lines = [f"✅ {host} – {ip} – {rtt}"]
+    # full mode
+    lines = [f"{prefix} {host} – {ip} – {rtt}{suffix}"]
     lines.append(f"    CN: {cn}")
     lines.append(f"    SANs: [{', '.join(san_list)}]")
     lines.append(f"    ASN: {asn}")
@@ -155,44 +161,60 @@ def query_asn_cymru(ip: str) -> Dict[str, str]:
 def check_tls_host(host: str) -> Dict:
     """Check TLS connectivity, certificate info, and ASN for a single host"""
     safe_print(f"[{timestamp()}] 🔄 Checking {host}...")
-    result = {'host': host, 'success': False, 'ip': None, 'rtt_ms': None,
-              'common_name': None, 'san_list': [], 'asn': 'n/A', 'asn_name': 'n/A',
-              'asn_prefix': '', 'asn_country': '', 'error': None}
+    result = {
+        'host': host,
+        'success': False,
+        'ip': None,
+        'rtt_ms': None,
+        'common_name': None,
+        'san_list': [],
+        'asn': 'n/A',
+        'asn_name': 'n/A',
+        'asn_prefix': '',
+        'asn_country': '',
+        'error': None
+    }
     try:
         start = time.time()
         ip = socket.gethostbyname(host)
         result['ip'] = ip
-        # ASN lookup remains metadata
+
+        # ASN lookup
         asn_info = query_asn_cymru(ip)
         result.update(asn_info)
 
-        # Create SSL context that accepts any cert (we just care about handshake)
+        # TLS handshake
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
-        # Accept certificates without verification but still retrieve them
         ctx.verify_mode = ssl.CERT_OPTIONAL
 
         with socket.create_connection((ip, 443), timeout=10) as sock:
             with ctx.wrap_socket(sock, server_hostname=host) as ssock:
-                # Mark reachability on successful TLS handshake
                 result['rtt_ms'] = int((time.time() - start) * 1000)
                 result['success'] = True
-                # Parse certificate fields, but don’t override success on failure
                 try:
                     cert = ssock.getpeercert()
                     subj = dict(x[0] for x in cert.get('subject', []))
                     result['common_name'] = subj.get('commonName', 'N/A')
-                    result['san_list'] = [v for t, v in cert.get('subjectAltName', []) if t in ('DNS','IP Address')]
+                    result['san_list'] = [
+                        v for t, v in cert.get('subjectAltName', [])
+                        if t in ('DNS', 'IP Address')
+                    ]
                 except Exception as e:
                     if DEBUG:
                         safe_print(f"DEBUG cert parse error for {host}: {e}")
     except Exception as e:
         name = type(e).__name__
-        if isinstance(e, ssl.SSLError): err = 'TLS_HANDSHAKE_FAILED'
-        elif isinstance(e, socket.gaierror): err = 'DNS_RESOLUTION_FAILED'
-        elif isinstance(e, socket.timeout): err = 'CONNECTION_TIMEOUT'
-        elif isinstance(e, ConnectionRefusedError): err = 'CONNECTION_REFUSED'
-        else: err = 'UNKNOWN_ERROR'
+        if isinstance(e, ssl.SSLError):
+            err = 'TLS_HANDSHAKE_FAILED'
+        elif isinstance(e, socket.gaierror):
+            err = 'DNS_RESOLUTION_FAILED'
+        elif isinstance(e, socket.timeout):
+            err = 'CONNECTION_TIMEOUT'
+        elif isinstance(e, ConnectionRefusedError):
+            err = 'CONNECTION_REFUSED'
+        else:
+            err = 'UNKNOWN_ERROR'
         result['error'] = f"{err}: {name}"
     return result
 
@@ -219,7 +241,7 @@ def main():
         safe_print(format_output(r, mode))
 
     total = len(results)
-    ok = sum(1 for r in results if r['success'])
+    ok = sum(1 for r in results if r.get('success'))
     safe_print(f"\n📊 Summary: {total} checked, {ok} successful, {total-ok} failed")
 
 if __name__ == "__main__":
