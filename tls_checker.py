@@ -27,17 +27,14 @@ asn_cache_lock = threading.Lock()
 # In-memory cache for ASN lookups
 iasn_cache: Dict[str, Dict] = {}
 
-
 def timestamp() -> str:
     """Get current timestamp in HH:MM:SS format"""
     return datetime.now().strftime("%H:%M:%S")
-
 
 def safe_print(message: str):
     """Thread-safe printing"""
     with print_lock:
         print(message)
-
 
 def parse_args():
     """Parse command-line arguments"""
@@ -47,7 +44,6 @@ def parse_args():
                         help='Output verbosity mode')
     parser.add_argument('--debug', action='store_true', help='Enable debug output')
     return parser.parse_args()
-
 
 def format_output(result: Dict, mode: str) -> str:
     """Format a single result dict according to the verbosity mode"""
@@ -63,7 +59,6 @@ def format_output(result: Dict, mode: str) -> str:
         return f"✅ {host} – {ip} – {rtt} – ASN{asn} ({name})"
 
     if mode == 'standard':
-        # show up to 3 SANs
         san_preview = ', '.join(san_list[:3])
         if len(san_list) > 3:
             san_preview += ', ...'
@@ -72,7 +67,6 @@ def format_output(result: Dict, mode: str) -> str:
             f"    SANs: [{san_preview}]"
         )
 
-    # full mode
     lines = [f"✅ {host} – {ip} – {rtt}"]
     lines.append(f"    CN: {cn}")
     lines.append(f"    SANs: [{', '.join(san_list)}]")
@@ -81,7 +75,6 @@ def format_output(result: Dict, mode: str) -> str:
     lines.append(f"    Prefix: {result.get('asn_prefix', '')}")
     lines.append(f"    Country: {result.get('asn_country', '')}")
     return '\n'.join(lines)
-
 
 def load_hosts(filename: str = 'urls.txt') -> List[str]:
     """Load and validate hostnames from file"""
@@ -109,7 +102,6 @@ def load_hosts(filename: str = 'urls.txt') -> List[str]:
 
     safe_print(f"📋 Found {len(hosts)} valid hosts to check\n")
     return hosts
-
 
 def query_asn_cymru(ip: str) -> Dict[str, str]:
     """Lookup ASN info for an IP via Team Cymru WHOIS service"""
@@ -160,7 +152,6 @@ def query_asn_cymru(ip: str) -> Dict[str, str]:
         iasn_cache[ip] = result
     return result
 
-
 def check_tls_host(host: str) -> Dict:
     """Check TLS connectivity, certificate info, and ASN for a single host"""
     safe_print(f"[{timestamp()}] 🔄 Checking {host}...")
@@ -171,20 +162,30 @@ def check_tls_host(host: str) -> Dict:
         start = time.time()
         ip = socket.gethostbyname(host)
         result['ip'] = ip
+        # ASN lookup remains metadata
         asn_info = query_asn_cymru(ip)
         result.update(asn_info)
 
+        # Create SSL context that accepts any cert (we just care about handshake)
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_REQUIRED
+        # Accept certificates without verification but still retrieve them
+        ctx.verify_mode = ssl.CERT_OPTIONAL
+
         with socket.create_connection((ip, 443), timeout=10) as sock:
             with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+                # Mark reachability on successful TLS handshake
                 result['rtt_ms'] = int((time.time() - start) * 1000)
-                cert = ssock.getpeercert()
-                subj = dict(x[0] for x in cert.get('subject', []))
-                result['common_name'] = subj.get('commonName', 'N/A')
-                result['san_list'] = [v for t,v in cert.get('subjectAltName', []) if t in ('DNS','IP Address')]
                 result['success'] = True
+                # Parse certificate fields, but don’t override success on failure
+                try:
+                    cert = ssock.getpeercert()
+                    subj = dict(x[0] for x in cert.get('subject', []))
+                    result['common_name'] = subj.get('commonName', 'N/A')
+                    result['san_list'] = [v for t, v in cert.get('subjectAltName', []) if t in ('DNS','IP Address')]
+                except Exception as e:
+                    if DEBUG:
+                        safe_print(f"DEBUG cert parse error for {host}: {e}")
     except Exception as e:
         name = type(e).__name__
         if isinstance(e, ssl.SSLError): err = 'TLS_HANDSHAKE_FAILED'
@@ -194,7 +195,6 @@ def check_tls_host(host: str) -> Dict:
         else: err = 'UNKNOWN_ERROR'
         result['error'] = f"{err}: {name}"
     return result
-
 
 def main():
     args = parse_args()
