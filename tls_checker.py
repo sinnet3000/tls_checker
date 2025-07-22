@@ -14,19 +14,18 @@ Features:
 - Verbose mode for debugging.
 """
 
+import argparse
+import random
+import re
 import socket
 import ssl
-import time
-import re
-import threading
-import argparse
 import sys
-import random
-from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Dict, TextIO, Optional
+import threading
+import time
 from collections import Counter
-
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from typing import Counter, Dict, List, Optional, TextIO
 # --- Globals ---
 
 # Thread locks for clean console output and cache protection
@@ -108,17 +107,35 @@ def is_comment_or_blank(line: str) -> bool:
         line_stripped.startswith('--')
     )
 
+
 def extract_hostname(line: str) -> Optional[str]:
     """
-    Extracts a hostname from a line, handling URLs.
-    Assumes the line is already stripped and not a comment/blank.
+    Extracts the hostname from a domain-like input, stripping any port number.
+
+    This function assumes the input is a domain, subdomain, IP address (IPv4), or 
+    localhost, optionally followed by a port, and does not contain a scheme 
+    (e.g., http://) or path (e.g., /path).
+
+    Args:
+        line: The input string to process.
+
+    Returns:
+        The cleaned hostname, or None if the input is empty.
     """
-    line = line.strip()
-    # Extract hostname from a URL if present
-    match = re.search(r'^(?:https?://)?([^/\s]+)', line)
-    if match:
-        return match.group(1)
-    return None
+    if not line:
+        return None
+
+    # Strip any leading/trailing whitespace from the input line.
+    hostname = line.strip()
+
+    # The hostname is the part of the string before the first colon.
+    # By splitting the string at the first colon and taking the first part [0],
+    # we effectively remove the port number if it exists. If no colon is
+    # present, split() will return a list with the original string as the
+    # single element, so this operation is safe for inputs without ports.
+    # This approach correctly handles domain names, subdomains, localhost, 
+    # and IPv4 addresses.
+    return hostname.split(':', 1)[0]
 
 def load_hosts(filename: str, verbose: bool, output_fh: Optional[TextIO]) -> List[str]:
     """
