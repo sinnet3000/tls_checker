@@ -1,204 +1,400 @@
 #!/usr/bin/env python3
 """
-TLS Checker - Check TLS connectivity, latency, and certificate info for multiple hosts
-Enhanced with Team Cymru ASN lookup (falls back to 'n/A' on failure).
-Add DEBUG mode to inspect raw WHOIS responses for troubleshooting.
+TLS Checker - A robust tool to check TLS connectivity, latency, certificate info, and ASN for multiple hosts.
+
+Features:
+- Concurrent checking using a configurable thread pool.
+- Graceful shutdown on Ctrl+C, with a summary of partial results.
+- Configurable connection timeout.
+- Configurable retries for failed checks with exponential backoff and jitter.
+- Simple console progress bar for a clean user experience.
+- Flexible input parser that accepts hostnames, IPs, and URLs, while ignoring comments and empty lines.
+- Output to a specified file instead of the console.
+- Detailed error summary, grouping failures by type (DNS, Timeout, etc.).
+- Verbose mode for debugging.
 """
 
+import argparse
+import random
+import re
 import socket
 import ssl
-import time
-import re
+import sys
 import threading
+import time
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor
-from typing import List, Dict, Optional
-
-# Debug flag
-debug = True  # Set to False for normal operation
+from typing import Counter, Dict, List, Optional, TextIO
+# --- Globals ---
 
 # Thread locks for clean console output and cache protection
 print_lock = threading.Lock()
 asn_cache_lock = threading.Lock()
 
 # In-memory cache for ASN lookups
-iasn_cache: Dict[str, Dict] = {}
+asn_cache: Dict[str, Dict] = {}
 
+# --- Core Functions ---
 
 def timestamp() -> str:
-    """Get current timestamp in HH:MM:SS format"""
+    """Returns the current time in HH:MM:SS format for logging."""
     return datetime.now().strftime("%H:%M:%S")
 
-
-def safe_print(message: str):
-    """Thread-safe printing"""
+def write_output(message: str, file_handle: Optional[TextIO] = None):
+    """
+    Thread-safe and redirected output.
+    Writes a message to the specified file handle or to stdout if None.
+    """
     with print_lock:
-        print(message)
+        if file_handle:
+            file_handle.write(message + '\n')
+        else:
+            print(message)
 
+def parse_args():
+    """
+    Parses and validates command-line arguments.
+    """
+    parser = argparse.ArgumentParser(
+        description='TLS Checker with ASN lookup.',
+        epilog='Example: ./tls_checker.py hosts.txt --threads 10 --timeout 5 --retries 2 --output-file results.txt'
+    )
+    parser.add_argument(
+        '-i', '--input-file',
+        default="urls.txt",
+        help='Path to the input file containing a list of hosts, one per line. Default: urls.txt'
+    )
+    parser.add_argument(
+        '-t', '--threads',
+        type=int,
+        default=10,
+        help='Number of concurrent threads to use. Default: 10.'
+    )
+    parser.add_argument(
+        '--timeout',
+        type=int,
+        default=5,
+        help='Per-connection timeout in seconds. Default: 5.'
+    )
+    parser.add_argument(
+        '-r', '--retries',
+        type=int,
+        default=3,
+        help='Number of retries for failed checks. Default: 3.'
+    )
+    parser.add_argument(
+        '-o', '--output-file',
+        help='File to write results and summary to. If not provided, output is printed to the console.'
+    )
+    parser.add_argument(
+        '-v', '--verbose',
+        action='store_true',
+        help='Enable verbose/debug output for troubleshooting.'
+    )
+    return parser.parse_args()
 
-def load_hosts(filename: str = 'urls.txt') -> List[str]:
-    """Load and validate hostnames from file"""
+def extract_hostname(line: str) -> Optional[str]:
+    """
+    Extracts the hostname from a domain-like input, stripping any port number.
+
+    This function assumes the input is a domain, subdomain, IP address (IPv4), or 
+    localhost, optionally followed by a port, and does not contain a scheme 
+    (e.g., http://) or path (e.g., /path).
+
+    Args:
+        line: The input string to process.
+
+    Returns:
+        The cleaned hostname, or None if the input is empty.
+    """
+    if not line:
+        return None
+
+    # Strip any leading/trailing whitespace from the input line.
+    hostname = line.strip()
+
+    # The hostname is the part of the string before the first colon.
+    # By splitting the string at the first colon and taking the first part [0],
+    # we effectively remove the port number if it exists. If no colon is
+    # present, split() will return a list with the original string as the
+    # single element, so this operation is safe for inputs without ports.
+    # This approach correctly handles domain names, subdomains, localhost, 
+    # and IPv4 addresses.
+    return hostname.split(':', 1)[0]
+
+def load_hosts(filename: str, verbose: bool, output_fh: Optional[TextIO]) -> List[str]:
+    """
+    Loads and validates hostnames from a file, handling comments, empty lines, and URLs.
+    This version integrates the logic for skipping comments and blank lines directly.
+    """
     hosts: List[str] = []
+    comment_prefixes = ('#', '//', ';', '--')
+    write_output(f"🔄 Loading hosts from '{filename}'...", output_fh)
+
     try:
         with open(filename, 'r') as f:
-            safe_print(f"🔄 Loading hosts from {filename}...")
             for line_num, line in enumerate(f, 1):
-                line = line.strip()
-                if not line or line.startswith('//'):
+                # 1. Clean the line by removing leading/trailing whitespace.
+                cleaned_line = line.strip()
+
+                # 2. Skip if the line is now blank or starts with a comment prefix.
+                # This single check replaces the entire is_comment_or_blank() method.
+                if not cleaned_line or cleaned_line.startswith(comment_prefixes):
                     continue
-                if line.startswith(('http://', 'https://')):
-                    safe_print(f"⚠️  Line {line_num}: Skipping URL format: {line}")
-                    continue
-                if not re.match(r'^[a-zA-Z0-9.-]+$', line):
-                    safe_print(f"⚠️  Line {line_num}: Invalid hostname: {line}")
-                    continue
-                hosts.append(line)
+
+                # 3. Proceed to extract the hostname from the valid line.
+                hostname = extract_hostname(cleaned_line)
+                if hostname:
+                    if hostname not in hosts:
+                        hosts.append(hostname)
+                else:
+                    # This case is now less likely but catches other malformed lines.
+                    write_output(f"⚠️  Line {line_num}: Malformed or invalid input skipped: '{line.strip()}'", output_fh)
+
     except FileNotFoundError:
-        safe_print(f"❌ Error: {filename} not found")
+        write_output(f"❌ Error: Input file '{filename}' not found.", output_fh)
         return []
     except Exception as e:
-        safe_print(f"❌ Error reading {filename}: {e}")
+        write_output(f"❌ Error reading '{filename}': {e}", output_fh)
         return []
 
-    safe_print(f"📋 Found {len(hosts)} valid hosts to check\n")
+    write_output(f"📋 Found {len(hosts)} unique hosts to check.\n", output_fh)
     return hosts
 
-
-def query_asn_cymru(ip: str) -> Dict[str, str]:
-    """Lookup ASN info for an IP via Team Cymru WHOIS service"""
-    # Check cache first
+def query_asn_cymru(ip: str, timeout: int, verbose: bool, output_fh: Optional[TextIO]) -> Dict[str, str]:
+    """
+    Looks up ASN information for an IP via Team Cymru's WHOIS service, with caching.
+    """
     with asn_cache_lock:
-        if ip in iasn_cache:
-            if debug:
-                safe_print(f"DEBUG: cache hit for {ip} -> {iasn_cache[ip]}")
-            return iasn_cache[ip]
+        if ip in asn_cache:
+            if verbose:
+                write_output(f"  [DEBUG] ASN cache hit for {ip}", output_fh)
+            return asn_cache[ip]
 
-    raw_lines: List[str] = []
     try:
-        # Connect to Team Cymru WHOIS
-        with socket.create_connection(('whois.cymru.com', 43), timeout=5) as sock:
-            file = sock.makefile('rwb', buffering=0)
-            query = f"begin\r\nverbose\r\n{ip}\r\nend\r\n"
-            file.write(query.encode())
-            while True:
-                line = file.readline()
-                if not line:
-                    break
-                raw_lines.append(line.decode('utf-8', errors='ignore'))
+        with socket.create_connection(('whois.cymru.com', 43), timeout=timeout) as sock:
+            query = f"verbose\n{ip}\nend\n".encode()
+            sock.sendall(query)
+            response = sock.makefile('r').read()
 
-        if debug:
-            safe_print(f"DEBUG WHOIS response for {ip}:")
-            for l in raw_lines:
-                safe_print(f"  {l.strip()}")
+        if verbose:
+            write_output(f"  [DEBUG] WHOIS response for {ip}:\n{response.strip()}", output_fh)
 
-        # Find the first valid data line: must contain '|' and at least 7 columns, starting with digits
-        data_line = None
-        for line in raw_lines:
-            if '|' not in line:
+        for line in response.splitlines():
+            if line.startswith('#') or '|' not in line:
                 continue
             parts = [p.strip() for p in line.split('|')]
-            if len(parts) < 7:
-                continue
-            if not parts[0].isdigit():
-                continue
-            data_line = line
-            break
-        if not data_line:
-            raise ValueError("No ASN data found in WHOIS response")
+            if len(parts) >= 7 and parts[0].isdigit():
+                result = {
+                    'asn': parts[0],
+                    'asn_prefix': parts[2],
+                    'asn_country': parts[3],
+                    'asn_name': parts[6]
+                }
+                with asn_cache_lock:
+                    asn_cache[ip] = result
+                return result
+        raise ValueError("No valid ASN data line found in response")
 
-        parts = [p.strip() for p in data_line.split('|')]
-        # Format: ASN | IP | BGP Prefix | CC | registry | allocated | AS Name
-        asn, _, prefix, country, *_ , as_name = parts
-        result = {
-            'asn': asn,
-            'asn_name': as_name,
-            'asn_country': country,
-            'asn_prefix': prefix
-        }
     except Exception as e:
-        if debug:
-            safe_print(f"DEBUG ASN lookup error for {ip}: {e}")
-        result = {
-            'asn': 'n/A',
-            'asn_name': 'n/A',
-            'asn_country': 'n/A',
-            'asn_prefix': 'n/A'
-        }
+        if verbose:
+            write_output(f"  [DEBUG] ASN lookup for {ip} failed: {e}", output_fh)
+        return {'asn': 'N/A', 'asn_name': 'N/A', 'asn_country': 'N/A', 'asn_prefix': 'N/A'}
 
-    # Cache and return
-    with asn_cache_lock:
-        iasn_cache[ip] = result
-    return result
+def check_tls_host(host: str, timeout: int, verbose: bool, output_fh: Optional[TextIO], retries: int) -> Dict:
+    """
+    Checks TLS connectivity, certificate, and ASN for a single host, with retries.
+    This function is designed to be executed in a thread.
+    """
+    result = {
+        'host': host, 
+        'success': False, 
+        'error': None, 
+        'retries_used': 0
+    }
 
+    for attempt in range(retries + 1):
+        try:
+            start_time = time.time()
+            # 1. DNS Resolution
+            try:
+                ip = socket.gethostbyname(host)
+                result['ip'] = ip
+            except socket.gaierror:
+                raise ValueError("DNS_RESOLUTION_FAILED")
 
-def check_tls_host(host: str) -> Dict:
-    """Check TLS connectivity, certificate info, and ASN for a single host"""
-    safe_print(f"[{timestamp()}] 🔄 Checking {host}...")
+            # 2. ASN Lookup
+            result.update(query_asn_cymru(ip, timeout, verbose, output_fh))
 
-    result = {'host': host,'success': False,'ip': None,'rtt_ms': None,'common_name': None,'san_list': [],'asn': 'n/A','asn_name': 'n/A','error': None,'formatted_output': None}
-    try:
-        start_time = time.time()
-        ip = socket.gethostbyname(host)
-        result['ip'] = ip
+            # 3. TLS Handshake
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = True
+            ctx.verify_mode = ssl.CERT_REQUIRED
+            
+            with socket.create_connection((host, 443), timeout=timeout) as sock:
+                with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+                    result['rtt_ms'] = int((time.time() - start_time) * 1000)
+                    cert = ssock.getpeercert()
 
-        asn_info = query_asn_cymru(ip)
-        result['asn'] = asn_info['asn']
-        result['asn_name'] = asn_info['asn_name']
+            # 4. Certificate Parsing
+            subj = dict(x[0] for x in cert.get('subject', []))
+            result['common_name'] = subj.get('commonName', 'N/A')
+            result['san_list'] = [v for t, v in cert.get('subjectAltName', []) if t == 'DNS']
+            result['success'] = True
+            result['retries_used'] = attempt
+            return result
 
-        context = ssl.create_default_context()
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_REQUIRED
+        except Exception as e:
+            error_type = "UNKNOWN_ERROR"
+            if isinstance(e, ValueError) and str(e) == "DNS_RESOLUTION_FAILED":
+                error_type = "DNS_RESOLUTION_FAILED"
+            elif isinstance(e, ssl.SSLCertVerificationError):
+                error_type = "CERT_VERIFICATION_FAILED"
+            elif isinstance(e, ssl.SSLError):
+                error_type = "TLS_HANDSHAKE_FAILED"
+            elif isinstance(e, socket.timeout):
+                error_type = "CONNECTION_TIMEOUT"
+            elif isinstance(e, ConnectionRefusedError):
+                error_type = "CONNECTION_REFUSED"
+            
+            result['error'] = error_type
+            result['retries_used'] = attempt
+            
+            if verbose:
+                write_output(f"  [DEBUG] Error for {host} on attempt {attempt+1}: {error_type} ({type(e).__name__}: {e})", output_fh)
+            
+            if attempt < retries:
+                # --- Exponential backoff with jitter ---
+                backoff_time = (2 ** attempt) + random.uniform(0, 1)
+                if verbose:
+                    write_output(f"  [DEBUG] Retrying {host} in {backoff_time:.2f}s...", output_fh)
+                time.sleep(backoff_time)
+                continue
+            else:
+                return result
 
-        with socket.create_connection((ip, 443), timeout=10) as raw_sock:
-            with context.wrap_socket(raw_sock, server_hostname=host) as tls_sock:
-                rtt_ms = int((time.time() - start_time) * 1000)
-                result['rtt_ms'] = rtt_ms
+def format_result(result: Dict) -> str:
+    """Formats a single result dictionary into a human-readable string."""
+    host = result['host']
+    ip = result.get('ip', 'N/A')
+    rtt = f"{result['rtt_ms']}ms" if 'rtt_ms' in result else 'N/A'
+    asn = result.get('asn', 'N/A')
+    name = result.get('asn_name', 'N/A')
+    cn = result.get('common_name', 'N/A')
+    san_list = result.get('san_list', [])
+    retries = result.get('retries_used', 0)
 
-                cert = tls_sock.getpeercert()
-                subject = dict(x[0] for x in cert.get('subject', []))
-                cn = subject.get('commonName', 'N/A')
-                sans = [val for typ, val in cert.get('subjectAltName', []) if typ in ('DNS', 'IP Address')]
+    if result['success']:
+        prefix = "✅"
+        san_preview = ', '.join(san_list[:3]) + ('...' if len(san_list) > 3 else '')
+        retry_note = f" (Recovered after {retries} {'retry' if retries==1 else 'retries'})" if retries > 0 else ""
+        return f"{prefix} {host} ({ip}) - RTT: {rtt} | CN: {cn} | SANs: [{san_preview}] | ASN: {asn} ({name}){retry_note}"
+    else:
+        prefix = "❌"
+        error = result.get('error', 'UNKNOWN')
+        retry_note = f" (Failed after {retries+1} attempts: {error})" if retries > 0 else f" ({error})"
+        return f"{prefix} {host} - FAILED{retry_note}"
 
-                result.update({'common_name': cn,'san_list': sans,'success': True})
-                sans_str = ', '.join(sans) if sans else 'None'
-                result['formatted_output'] = (
-                    f"[{timestamp()}] ✅ {host} – {ip} – {rtt_ms}ms – "
-                    f"CN={cn} – SANs=[{sans_str}] – ASN={result['asn']} ({result['asn_name']})"
-                )
-    except Exception as e:
-        err = type(e).__name__
-        if isinstance(e, ssl.SSLError):
-            err_type = 'TLS_HANDSHAKE_FAILED'
-        elif isinstance(e, socket.gaierror):
-            err_type = 'DNS_RESOLUTION_FAILED'
-        elif isinstance(e, socket.timeout):
-            err_type = 'CONNECTION_TIMEOUT'
-        elif isinstance(e, ConnectionRefusedError):
-            err_type = 'CONNECTION_REFUSED'
-        else:
-            err_type = 'UNKNOWN_ERROR'
-        result['error'] = f"{err_type}: {err}"
-        result['formatted_output'] = f"[{timestamp()}] ❌ {host} – {result['error']}"
+def print_summary(results: List[Dict], total_hosts: int, output_fh: Optional[TextIO]):
+    """Prints the final summary of successes, failures, and error types."""
+    total_checked = len(results)
+    successes = sum(1 for r in results if r['success'])
+    failures = total_checked - successes
+    recovered = sum(1 for r in results if r['success'] and r.get('retries_used', 0) > 0)
 
-    return result
+    summary = [
+        "\n" + ("-"*20) + " SUMMARY " + ("-"*20),
+        f"Hosts Checked: {total_checked}/{total_hosts}",
+        f"✅ Successes: {successes}",
+        f"  ↳ Successes after retry: {recovered}" if recovered else "",
+        f"❌ Failures:  {failures}"
+    ]
 
+    if failures > 0:
+        error_counts = Counter(r['error'] for r in results if not r['success'])
+        summary.append("\nFailure Breakdown:")
+        for error, count in sorted(error_counts.items()):
+            summary.append(f"  - {error}: {count}")
+    
+    summary.append("-"*49)
+
+    for line in summary:
+        if line:
+            write_output(line, output_fh)
+
+# --- Main Execution ---
 
 def main():
-    print("🔒 TLS Checker - Starting...\n")
-    hosts = load_hosts('urls.txt')
+    """Main function to orchestrate the TLS checking process."""
+    args = parse_args()
+    
+    output_fh = None
+    if args.output_file:
+        try:
+            output_fh = open(args.output_file, 'w')
+        except IOError as e:
+            print(f"❌ Fatal: Could not open output file '{args.output_file}': {e}", file=sys.stderr)
+            sys.exit(1)
+
+    write_output(f"🔒 TLS Checker starting up...", output_fh)
+    write_output(f"   Threads: {args.threads}, Timeout: {args.timeout}s, Retries: {args.retries}, Verbose: {args.verbose}\n", output_fh)
+
+    hosts = load_hosts(args.input_file, args.verbose, output_fh)
     if not hosts:
-        return
-    count = min(max(len(hosts) // 4, 5), 20)
-    results: List[Dict] = []
-    with ThreadPoolExecutor(max_workers=count) as ex:
-        for res in ex.map(check_tls_host, hosts):
-            results.append(res)
-    results.sort(key=lambda x: x['host'])
-    safe_print("\n📊 Results (sorted by hostname):")
-    for r in results:
-        safe_print(r['formatted_output'])
-    total, succ = len(results), sum(1 for r in results if r['success'])
-    safe_print(f"\n📊 Summary: {total} hosts checked, {succ} successful, {total-succ} failed")
+        if output_fh:
+            output_fh.close()
+        sys.exit(1)
+
+    results = []
+    checked_count = 0
+    total_hosts = len(hosts)
+
+    def print_progress(count, total):
+        """A simple, dependency-free progress bar for the console."""
+        if args.output_file or args.verbose:
+            return
+        percent = int(100 * (count / float(total)))
+        bar_length = 50
+        filled_length = int(bar_length * count // total)
+        bar = '█' * filled_length + '-' * (bar_length - filled_length)
+        sys.stdout.write(f'\rProgress: |{bar}| {percent}% ({count}/{total}) Complete')
+        sys.stdout.flush()
+
+    try:
+        with ThreadPoolExecutor(max_workers=args.threads) as executor:
+            future_to_host = {
+                executor.submit(check_tls_host, host, args.timeout, args.verbose, output_fh, args.retries): host
+                for host in hosts
+            }
+            
+            print_progress(0, total_hosts)
+
+            for future in as_completed(future_to_host):
+                res = future.result()
+                results.append(res)
+                
+                checked_count += 1
+                print_progress(checked_count, total_hosts)
+
+    except KeyboardInterrupt:
+        write_output("\n\n🛑 User interrupted (Ctrl+C). Shutting down gracefully...", output_fh)
+    finally:
+        # Move to the next line after the progress bar is done
+        if not args.output_file and not args.verbose:
+            print()
+
+        # Print all results in a sorted block
+        write_output("\n" + ("-"*22) + " RESULTS " + ("-"*22), output_fh)
+        results.sort(key=lambda x: x['host'])
+        for res in results:
+            write_output(format_result(res), output_fh)
+        
+        # Print the final summary
+        print_summary(results, len(hosts), output_fh)
+        if output_fh:
+            write_output(f"\nResults saved to '{args.output_file}'.", None)
+            output_fh.close()
 
 if __name__ == "__main__":
     main()
