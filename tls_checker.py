@@ -94,20 +94,6 @@ def parse_args():
     )
     return parser.parse_args()
 
-def is_comment_or_blank(line: str) -> bool:
-    """
-    Determines if a line is a comment or blank. Accepts #, //, ;, -- (with leading whitespace).
-    """
-    line_stripped = line.lstrip()
-    return (
-        not line_stripped or
-        line_stripped.startswith('#') or
-        line_stripped.startswith('//') or
-        line_stripped.startswith(';') or
-        line_stripped.startswith('--')
-    )
-
-
 def extract_hostname(line: str) -> Optional[str]:
     """
     Extracts the hostname from a domain-like input, stripping any port number.
@@ -140,20 +126,32 @@ def extract_hostname(line: str) -> Optional[str]:
 def load_hosts(filename: str, verbose: bool, output_fh: Optional[TextIO]) -> List[str]:
     """
     Loads and validates hostnames from a file, handling comments, empty lines, and URLs.
+    This version integrates the logic for skipping comments and blank lines directly.
     """
     hosts: List[str] = []
+    comment_prefixes = ('#', '//', ';', '--')
     write_output(f"🔄 Loading hosts from '{filename}'...", output_fh)
+
     try:
         with open(filename, 'r') as f:
             for line_num, line in enumerate(f, 1):
-                if is_comment_or_blank(line):
+                # 1. Clean the line by removing leading/trailing whitespace.
+                cleaned_line = line.strip()
+
+                # 2. Skip if the line is now blank or starts with a comment prefix.
+                # This single check replaces the entire is_comment_or_blank() method.
+                if not cleaned_line or cleaned_line.startswith(comment_prefixes):
                     continue
-                hostname = extract_hostname(line)
+
+                # 3. Proceed to extract the hostname from the valid line.
+                hostname = extract_hostname(cleaned_line)
                 if hostname:
                     if hostname not in hosts:
                         hosts.append(hostname)
                 else:
+                    # This case is now less likely but catches other malformed lines.
                     write_output(f"⚠️  Line {line_num}: Malformed or invalid input skipped: '{line.strip()}'", output_fh)
+
     except FileNotFoundError:
         write_output(f"❌ Error: Input file '{filename}' not found.", output_fh)
         return []
