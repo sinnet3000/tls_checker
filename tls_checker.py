@@ -6,7 +6,8 @@ Features:
 - Concurrent checking using a configurable thread pool.
 - Graceful shutdown on Ctrl+C, with a summary of partial results.
 - Configurable connection timeout.
-- Configurable retries for failed checks.
+- Configurable retries for failed checks with exponential backoff and jitter.
+- Simple console progress bar for a clean user experience.
 - Flexible input parser that accepts hostnames, IPs, and URLs, while ignoring comments and empty lines.
 - Output to a specified file instead of the console.
 - Detailed error summary, grouping failures by type (DNS, Timeout, etc.).
@@ -20,6 +21,7 @@ import re
 import threading
 import argparse
 import sys
+import random
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, TextIO, Optional
@@ -194,7 +196,7 @@ def check_tls_host(host: str, timeout: int, verbose: bool, output_fh: Optional[T
         'host': host, 
         'success': False, 
         'error': None, 
-        'retries_used': 0  # For UX output
+        'retries_used': 0
     }
 
     for attempt in range(retries + 1):
@@ -240,14 +242,22 @@ def check_tls_host(host: str, timeout: int, verbose: bool, output_fh: Optional[T
                 error_type = "CONNECTION_TIMEOUT"
             elif isinstance(e, ConnectionRefusedError):
                 error_type = "CONNECTION_REFUSED"
+            
             result['error'] = error_type
             result['retries_used'] = attempt
+            
             if verbose:
                 write_output(f"  [DEBUG] Error for {host} on attempt {attempt+1}: {error_type} ({type(e).__name__}: {e})", output_fh)
+            
             if attempt < retries:
-                continue  # silently try next
+                # --- Exponential backoff with jitter ---
+                backoff_time = (2 ** attempt) + random.uniform(0, 1)
+                if verbose:
+                    write_output(f"  [DEBUG] Retrying {host} in {backoff_time:.2f}s...", output_fh)
+                time.sleep(backoff_time)
+                continue
             else:
-                return result  # failed after all attempts
+                return result
 
 def format_result(result: Dict) -> str:
     """Formats a single result dictionary into a human-readable string."""
@@ -259,7 +269,6 @@ def format_result(result: Dict) -> str:
     cn = result.get('common_name', 'N/A')
     san_list = result.get('san_list', [])
     retries = result.get('retries_used', 0)
-    max_retries = result.get('max_retries', None)  # For future
 
     if result['success']:
         prefix = "✅"
@@ -296,7 +305,7 @@ def print_summary(results: List[Dict], total_hosts: int, output_fh: Optional[Tex
     summary.append("-"*49)
 
     for line in summary:
-        if line:  # avoid blank lines in summary
+        if line:
             write_output(line, output_fh)
 
 # --- Main Execution ---
@@ -305,7 +314,6 @@ def main():
     """Main function to orchestrate the TLS checking process."""
     args = parse_args()
     
-    # Open output file if specified, otherwise it remains None
     output_fh = None
     if args.output_file:
         try:
@@ -324,25 +332,53 @@ def main():
         sys.exit(1)
 
     results = []
+    checked_count = 0
+    total_hosts = len(hosts)
+
+    def print_progress(count, total):
+        """A simple, dependency-free progress bar for the console."""
+        if args.output_file or args.verbose:
+            return
+        percent = int(100 * (count / float(total)))
+        bar_length = 50
+        filled_length = int(bar_length * count // total)
+        bar = '█' * filled_length + '-' * (bar_length - filled_length)
+        sys.stdout.write(f'\rProgress: |{bar}| {percent}% ({count}/{total}) Complete')
+        sys.stdout.flush()
+
     try:
         with ThreadPoolExecutor(max_workers=args.threads) as executor:
             future_to_host = {
                 executor.submit(check_tls_host, host, args.timeout, args.verbose, output_fh, args.retries): host
                 for host in hosts
             }
+            
+            print_progress(0, total_hosts)
+
             for future in as_completed(future_to_host):
                 res = future.result()
-                # Attach max_retries for format_result if needed later
-                res['max_retries'] = args.retries
-                write_output(format_result(res), output_fh)
                 results.append(res)
+                
+                checked_count += 1
+                print_progress(checked_count, total_hosts)
+
     except KeyboardInterrupt:
         write_output("\n\n🛑 User interrupted (Ctrl+C). Shutting down gracefully...", output_fh)
     finally:
+        # Move to the next line after the progress bar is done
+        if not args.output_file and not args.verbose:
+            print()
+
+        # Print all results in a sorted block
+        write_output("\n" + ("-"*22) + " RESULTS " + ("-"*22), output_fh)
         results.sort(key=lambda x: x['host'])
+        for res in results:
+            write_output(format_result(res), output_fh)
+        
+        # Print the final summary
         print_summary(results, len(hosts), output_fh)
         if output_fh:
-            write_output(f"\nResults saved to '{args.output_file}'.", None) # Final message to console
+            write_output(f"\nResults saved to '{args.output_file}'.", None)
             output_fh.close()
 
 if __name__ == "__main__":
