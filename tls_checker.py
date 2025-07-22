@@ -139,7 +139,6 @@ def load_hosts(filename: str, verbose: bool, output_fh: Optional[TextIO]) -> Lis
                 cleaned_line = line.strip()
 
                 # 2. Skip if the line is now blank or starts with a comment prefix.
-                # This single check replaces the entire is_comment_or_blank() method.
                 if not cleaned_line or cleaned_line.startswith(comment_prefixes):
                     continue
 
