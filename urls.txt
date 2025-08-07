@@ -1,0 +1,76 @@
+// DNS/CDN
+one.one.one.one
+
+// Payment Services
+paypal.com
+m.stripe.com
+checkout.stripe.com
+js.stripe.com
+pay.google.com
+apple-pay-gateway.apple.com 
+
+// WhatsApp
+v.whatsapp.net
+hmedia.fhmo1-2.fna.whatsapp.net
+media.fntr7-1.fna.whatsapp.net
+web.whatsapp.com
+
+// Instagram Media CDNs
+instagram.fntr7-1.fna.fbcdn.net
+instagram.fhmo1-2.fna.fbcdn.net
+instagram.fhmo2-1.fna.fbcdn.net
+scontent.cdninstagram.com
+instagram.fmex20-1.fna.fbcdn.net
+instagram.fpbc5-1.fna.fbcdn.net
+
+// Facebook
+facebook.com
+graph.facebook.com
+zero.facebook.com
+telegram.org
+t.me
+
+//Websites
+www.wikipedia.org
+
+// Captive Portals
+wifi-am.telmex.com
+gate.zequenze.com
+
+// Airlines & Inflight
+www.aeromexico.com
+viasat.com
+intelsat.com
+inflightinternet.com
+wifionboard.com
+
+// Mobile Services
+services.gigsky.com
+
+// Connectivity Checks
+captive.apple.com
+connectivitycheck.gstatic.com
+connectivitycheck.android.com
+api.push.apple.com
+
+// Google Services
+fonts.gstatic.com
+googletagmanager.com
+clients3.google.com
+fcmtoken.googleapis.com
+firebaseappcheck.googleapis.com
+
+// SSO
+accounts.google.com
+login.microsoftonline.com
+login.live.com
+
+example.com
+
+//Uber
+tc2.uber.com
+cn-cloudflare.pidetupop.com
+ewp.uber.com
+cn-geo1.uber.com
+cn-dc1.uber.com
+pusher.uber.com
