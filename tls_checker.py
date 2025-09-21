@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """
-TLS Checker - A robust tool to check TLS connectivity, latency, certificate info, and ASN for multiple hosts.
+TLS Checker - Check TLS connectivity, latency, certificate info, ASN, and HTTP/2 readiness.
 
-Features:
-- Concurrent checking using a configurable thread pool.
-- Graceful shutdown on Ctrl+C, with a summary of partial results.
-- Configurable connection timeout.
-- Configurable retries for failed checks with exponential backoff and jitter.
-- Simple console progress bar for a clean user experience.
-- Flexible input parser that accepts hostnames, IPs, and URLs, while ignoring comments and empty lines.
-- Output to a specified file instead of the console.
-- Detailed error summary, grouping failures by type (DNS, Timeout, etc.).
-- Verbose mode for debugging.
+Adds:
+- TLS 1.3 + HTTP/2 validation (pure-stdlib H2 probe).
+- Four-way outcome (mutually exclusive, in precedence order):
+  🔵 Full success   = TLSv1.3 + ALPN=h2 + H2: ok
+  🟢 Success        = TLSv1.3 (ALPN/H2 may be missing or failing)
+  🟡 Partial        = Reachable TLS but not TLSv1.3 (e.g., TLSv1.2; any ALPN/H2)
+  ❌ Failure        = DNS/timeout/TLS/other error
+
+No "overall" line; summary lists Full success, Success (TLS 1.3), Partial, Complete failure.
 """
 
 import argparse
@@ -25,7 +24,8 @@ import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from typing import Counter, Dict, List, Optional, TextIO
+from typing import Dict, List, Optional, TextIO, Tuple
+
 # --- Globals ---
 
 # Thread locks for clean console output and cache protection
@@ -57,7 +57,7 @@ def parse_args():
     Parses and validates command-line arguments.
     """
     parser = argparse.ArgumentParser(
-        description='TLS Checker with ASN lookup.',
+        description='TLS Checker with ASN + HTTP/2 validation.',
         epilog='Example: ./tls_checker.py hosts.txt --threads 10 --timeout 5 --retries 2 --output-file results.txt'
     )
     parser.add_argument(
@@ -101,26 +101,10 @@ def extract_hostname(line: str) -> Optional[str]:
     This function assumes the input is a domain, subdomain, IP address (IPv4), or 
     localhost, optionally followed by a port, and does not contain a scheme 
     (e.g., http://) or path (e.g., /path).
-
-    Args:
-        line: The input string to process.
-
-    Returns:
-        The cleaned hostname, or None if the input is empty.
     """
     if not line:
         return None
-
-    # Strip any leading/trailing whitespace from the input line.
     hostname = line.strip()
-
-    # The hostname is the part of the string before the first colon.
-    # By splitting the string at the first colon and taking the first part [0],
-    # we effectively remove the port number if it exists. If no colon is
-    # present, split() will return a list with the original string as the
-    # single element, so this operation is safe for inputs without ports.
-    # This approach correctly handles domain names, subdomains, localhost, 
-    # and IPv4 addresses.
     return hostname.split(':', 1)[0]
 
 def load_hosts(filename: str, verbose: bool, output_fh: Optional[TextIO]) -> List[str]:
@@ -135,22 +119,15 @@ def load_hosts(filename: str, verbose: bool, output_fh: Optional[TextIO]) -> Lis
     try:
         with open(filename, 'r') as f:
             for line_num, line in enumerate(f, 1):
-                # 1. Clean the line by removing leading/trailing whitespace.
                 cleaned_line = line.strip()
-
-                # 2. Skip if the line is now blank or starts with a comment prefix.
                 if not cleaned_line or cleaned_line.startswith(comment_prefixes):
                     continue
-
-                # 3. Proceed to extract the hostname from the valid line.
                 hostname = extract_hostname(cleaned_line)
                 if hostname:
                     if hostname not in hosts:
                         hosts.append(hostname)
                 else:
-                    # This case is now less likely but catches other malformed lines.
                     write_output(f"⚠️  Line {line_num}: Malformed or invalid input skipped: '{line.strip()}'", output_fh)
-
     except FileNotFoundError:
         write_output(f"❌ Error: Input file '{filename}' not found.", output_fh)
         return []
@@ -201,6 +178,66 @@ def query_asn_cymru(ip: str, timeout: int, verbose: bool, output_fh: Optional[Te
             write_output(f"  [DEBUG] ASN lookup for {ip} failed: {e}", output_fh)
         return {'asn': 'N/A', 'asn_name': 'N/A', 'asn_country': 'N/A', 'asn_prefix': 'N/A'}
 
+# --- Minimal HTTP/2 stdlib probe (no external deps) ---
+
+def _h2_probe_over_tls(ssock: ssl.SSLSocket, timeout: float) -> bool:
+    """
+    Minimal HTTP/2 probe using only stdlib over an *already-handshaken* TLS socket
+    with ALPN 'h2'. We:
+      1) send the HTTP/2 client connection preface
+      2) send an empty SETTINGS frame
+      3) read one frame from the server and check it's SETTINGS (type=0x4)
+
+    Returns True if SETTINGS is seen; False otherwise.
+    """
+    ssock.settimeout(timeout)
+
+    # HTTP/2 client connection preface (RFC 7540 §3.5)
+    preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+
+    # Empty SETTINGS frame: length=0, type=0x04, flags=0x00, stream_id=0
+    # Frame header: length(3) | type(1) | flags(1) | R+stream_id(4)
+    settings_frame = b"\x00\x00\x00" + b"\x04" + b"\x00" + b"\x00\x00\x00\x00"
+
+    try:
+        ssock.sendall(preface + settings_frame)
+
+        # Read one frame header (9 bytes)
+        hdr = b""
+        while len(hdr) < 9:
+            chunk = ssock.recv(9 - len(hdr))
+            if not chunk:
+                return False
+            hdr += chunk
+
+        length = (hdr[0] << 16) | (hdr[1] << 8) | hdr[2]
+        ftype = hdr[3]  # 0x04 is SETTINGS
+
+        # Drain payload if any to keep the socket clean
+        remaining = length
+        while remaining > 0:
+            chunk = ssock.recv(min(remaining, 65535))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+
+        return ftype == 0x04
+    except Exception:
+        return False
+
+def classify(result: Dict) -> Tuple[str, str]:
+    """
+    Decide final status/icon from computed fields.
+    Returns (status, icon) where status ∈ {"full","success","partial","failure"}.
+    """
+    if not result.get('success'):
+        return "failure", "❌"
+    if result.get('is_full_success'):
+        return "full", "🔵"
+    if result.get('is_tls13_success'):
+        return "success", "🟢"
+    return "partial", "🟡"
+
 def check_tls_host(host: str, timeout: int, verbose: bool, output_fh: Optional[TextIO], retries: int) -> Dict:
     """
     Checks TLS connectivity, certificate, and ASN for a single host, with retries.
@@ -227,21 +264,120 @@ def check_tls_host(host: str, timeout: int, verbose: bool, output_fh: Optional[T
             result.update(query_asn_cymru(ip, timeout, verbose, output_fh))
 
             # 3. TLS Handshake
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = True
-            ctx.verify_mode = ssl.CERT_REQUIRED
-            
-            with socket.create_connection((host, 443), timeout=timeout) as sock:
-                with ctx.wrap_socket(sock, server_hostname=host) as ssock:
-                    result['rtt_ms'] = int((time.time() - start_time) * 1000)
-                    cert = ssock.getpeercert()
+            #
+            # Policy: try strict (CERT_REQUIRED) first. If that fails with a
+            # certificate verification error, retry with an "insecure" context
+            # so we can still collect ALPN/TLS version & report cert_ok=false.
+            cert_ok = None
+            tls_version = None
+            alpn_selected = "none"
+            cert = None
+            last_exc = None
+
+            for mode in ("strict", "insecure"):
+                try:
+                    ctx = ssl.create_default_context()
+                    ctx.check_hostname = True
+                    ctx.verify_mode = ssl.CERT_REQUIRED
+                    if mode == "insecure":
+                        ctx = ssl._create_unverified_context()
+                        # Hostname check disabled implicitly in unverified mode.
+
+                    # Offer HTTP/2 and HTTP/1.1 via ALPN
+                    try:
+                        ctx.set_alpn_protocols(["h2", "http/1.1"])
+                    except Exception:
+                        # Older OpenSSL builds might not support ALPN
+                        pass
+
+                    with socket.create_connection((host, 443), timeout=timeout) as sock:
+                        with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+                            result['rtt_ms'] = int((time.time() - start_time) * 1000)
+                            cert = ssock.getpeercert()
+                            tls_version = getattr(ssock, "version", lambda: None)()
+                            alpn_selected = getattr(ssock, "selected_alpn_protocol", lambda: None)() or "none"
+                            cert_ok = (mode == "strict")
+                    # If we got here, handshake succeeded; break.
+                    break
+                except ssl.SSLCertVerificationError as e:
+                    last_exc = e
+                    cert_ok = False
+                    if verbose:
+                        write_output(f"  [DEBUG] Cert verification failed for {host}, retrying insecurely...", output_fh)
+                    continue
+                except Exception as e:
+                    last_exc = e
+                    # Non-cert failures shouldn't switch to insecure mode; bail out.
+                    raise
+
+            if tls_version is None:
+                if last_exc:
+                    raise last_exc
+                raise ssl.SSLError("TLS handshake failed unexpectedly")
+
+            # --- HTTP/2 probe (stdlib) ---
+            # Rule:
+            # - If ALPN != h2 → H2 = n/a
+            # - If ALPN == h2 and probe succeeds → H2 = ok
+            # - If ALPN == h2 and probe fails → H2 = fail
+            http2_ok = None
+            if alpn_selected == "h2":
+                try:
+                    # Use a fresh short-lived TLS session for the probe.
+                    _ctx = ssl.create_default_context()
+                    _ctx.check_hostname = True
+                    _ctx.verify_mode = ssl.CERT_REQUIRED
+                    try:
+                        _ctx.set_alpn_protocols(["h2"])
+                    except Exception:
+                        pass
+                    with socket.create_connection((host, 443), timeout=timeout) as _sock:
+                        with _ctx.wrap_socket(_sock, server_hostname=host) as _ssock:
+                            if _ssock.selected_alpn_protocol() == "h2":
+                                http2_ok = _h2_probe_over_tls(_ssock, float(timeout))
+                            else:
+                                http2_ok = False
+                except Exception as e:
+                    http2_ok = False
+                    if verbose:
+                        write_output(f"  [DEBUG] HTTP/2 probe failed for {host}: {type(e).__name__}: {e}", output_fh)
+            else:
+                http2_ok = None  # ALPN wasn't h2 → n/a
 
             # 4. Certificate Parsing
-            subj = dict(x[0] for x in cert.get('subject', []))
-            result['common_name'] = subj.get('commonName', 'N/A')
-            result['san_list'] = [v for t, v in cert.get('subjectAltName', []) if t == 'DNS']
+            cn = 'N/A'
+            san_list = []
+            try:
+                subj = dict(x[0] for x in (cert or {}).get('subject', []))
+                cn = subj.get('commonName', 'N/A')
+                san_list = [v for t, v in (cert or {}).get('subjectAltName', []) if t == 'DNS']
+            except Exception:
+                pass
+
+            # Populate result
+            result['common_name'] = cn
+            result['san_list'] = san_list
             result['success'] = True
             result['retries_used'] = attempt
+
+            # Attach telemetry
+            result['tls_version'] = tls_version or 'N/A'
+            result['alpn_selected'] = alpn_selected or 'none'
+            result['http2_ok'] = http2_ok  # True|False|None (None => n/a)
+            result['cert_ok'] = bool(cert_ok)
+
+            # Strict "full success" definition for per-host icon & summary
+            tls_v_up = (result['tls_version'] or '').upper()
+            result['is_full_success'] = (tls_v_up == 'TLSV1.3' and alpn_selected == 'h2' and http2_ok is True)
+
+            # New: plain TLS 1.3 success (regardless of ALPN/H2)
+            result['is_tls13_success'] = (tls_v_up == 'TLSV1.3')
+
+            # New: classify once, store for formatting & summary
+            status, icon = classify(result)
+            result['status'] = status
+            result['icon'] = icon
+
             return result
 
         except Exception as e:
@@ -264,7 +400,7 @@ def check_tls_host(host: str, timeout: int, verbose: bool, output_fh: Optional[T
                 write_output(f"  [DEBUG] Error for {host} on attempt {attempt+1}: {error_type} ({type(e).__name__}: {e})", output_fh)
             
             if attempt < retries:
-                # --- Exponential backoff with jitter ---
+                # Exponential backoff with jitter
                 backoff_time = (2 ** attempt) + random.uniform(0, 1)
                 if verbose:
                     write_output(f"  [DEBUG] Retrying {host} in {backoff_time:.2f}s...", output_fh)
@@ -284,11 +420,28 @@ def format_result(result: Dict) -> str:
     san_list = result.get('san_list', [])
     retries = result.get('retries_used', 0)
 
+    tls_v = result.get('tls_version', 'N/A')
+    alpn = result.get('alpn_selected', 'none')
+    h2_ok = result.get('http2_ok', None)
+    cert_ok = result.get('cert_ok', False)
+
+    # Render H2 field per rule
+    if h2_ok is True:
+        h2_txt = "ok"
+    elif h2_ok is False:
+        h2_txt = "fail"
+    else:
+        h2_txt = "n/a"
+
     if result['success']:
-        prefix = "✅"
+        # Determine per-host icon from classifier
+        icon = result.get('icon', "🟡")
+
         san_preview = ', '.join(san_list[:3]) + ('...' if len(san_list) > 3 else '')
         retry_note = f" (Recovered after {retries} {'retry' if retries==1 else 'retries'})" if retries > 0 else ""
-        return f"{prefix} {host} ({ip}) - RTT: {rtt} | CN: {cn} | SANs: [{san_preview}] | ASN: {asn} ({name}){retry_note}"
+        core = f"{icon} {host} ({ip}) - RTT: {rtt} | CN: {cn} | SANs: [{san_preview}] | ASN: {asn} ({name}){retry_note}"
+        extra = f" | TLS: {tls_v} | ALPN: {alpn} | H2: {h2_txt} | Cert: " + ("ok" if cert_ok else "bad")
+        return core + extra
     else:
         prefix = "❌"
         error = result.get('error', 'UNKNOWN')
@@ -296,22 +449,27 @@ def format_result(result: Dict) -> str:
         return f"{prefix} {host} - FAILED{retry_note}"
 
 def print_summary(results: List[Dict], total_hosts: int, output_fh: Optional[TextIO]):
-    """Prints the final summary of successes, failures, and error types."""
+    """Prints the final summary with explicit buckets."""
     total_checked = len(results)
-    successes = sum(1 for r in results if r['success'])
-    failures = total_checked - successes
-    recovered = sum(1 for r in results if r['success'] and r.get('retries_used', 0) > 0)
+    failures = sum(1 for r in results if r.get('status') == 'failure')
+    full_success = sum(1 for r in results if r.get('status') == 'full')
+    green_success = sum(1 for r in results if r.get('status') == 'success')
+    partial_success = sum(1 for r in results if r.get('status') == 'partial')
+
+    recovered = sum(1 for r in results if r.get('success') and r.get('retries_used', 0) > 0)
 
     summary = [
         "\n" + ("-"*20) + " SUMMARY " + ("-"*20),
         f"Hosts Checked: {total_checked}/{total_hosts}",
-        f"✅ Successes: {successes}",
+        f"🔵 Full success: {full_success}",
+        f"🟢 Success (TLS 1.3): {green_success}",
+        f"🟡 Partial success: {partial_success}",
+        f"❌ Complete failure: {failures}",
         f"  ↳ Successes after retry: {recovered}" if recovered else "",
-        f"❌ Failures:  {failures}"
     ]
 
     if failures > 0:
-        error_counts = Counter(r['error'] for r in results if not r['success'])
+        error_counts = Counter(r['error'] for r in results if r.get('status') == 'failure')
         summary.append("\nFailure Breakdown:")
         for error, count in sorted(error_counts.items()):
             summary.append(f"  - {error}: {count}")
