@@ -3,7 +3,7 @@ one.one.one.one
 
 // Payment Services
 paypal.com
-m.stripe.com
+stripe.com
 checkout.stripe.com
 js.stripe.com
 pay.google.com
@@ -63,9 +63,13 @@ firebaseappcheck.googleapis.com
 // SSO
 accounts.google.com
 login.microsoftonline.com
-login.live.com
 
 example.com
+
+// Telcel
+www.opinarcuenta.com
+www.mitelcel.com
+aprende.org
 
 //Uber
 tc2.uber.com
