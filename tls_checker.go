@@ -3,7 +3,7 @@
 // Purpose
 //
 //	Concurrent TLS diagnostics for a list of hosts with optional HTTP/2 probe and ASN lookup.
-//	Designed to feel like idiomatic Go: small helpers, clear error paths, context timeouts,
+//	Designed to feel idiomatic Go: focused helpers, clear error paths, context timeouts,
 //	simple flags, and deterministic output.
 //
 // Features
@@ -16,7 +16,7 @@
 //     ❌ failure  = any error (DNS/timeout/TLS/etc.)
 //   - Team Cymru WHOIS (ASN) with in-memory cache (optional)
 //   - Retries with exponential backoff + jitter
-//   - Text or JSONL output
+//   - Text output only to stdout or a file of your choice
 //
 // Build
 //
@@ -24,15 +24,14 @@
 //
 // Examples
 //
-//	./tlscheck -i urls.txt -t 16 --timeout 5s --retries 2 --h2-probe=xnet --jsonl
-//	./tlscheck -i urls.txt --min-tls=1.3 --no-asn --alpn=h2,http/1.1
+//	./tlscheck -i urls.txt -t 16 --timeout 5s --retries 2
+//	./tlscheck -i urls.txt --no-asn
 package main
 
 import (
 	"bufio"
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -41,6 +40,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"sort"
@@ -51,28 +51,29 @@ import (
 	"time"
 
 	"golang.org/x/net/http2"
+	"golang.org/x/sync/errgroup"
 )
 
 // Result captures one host diagnostic row.
 type Result struct {
-	Host        string   `json:"host"`
-	IP          string   `json:"ip,omitempty"`
-	RTTms       int      `json:"rtt_ms,omitempty"`
-	ASN         string   `json:"asn,omitempty"`
-	ASNName     string   `json:"asn_name,omitempty"`
-	ASNCountry  string   `json:"asn_country,omitempty"`
-	ASPrefix    string   `json:"asn_prefix,omitempty"`
-	CommonName  string   `json:"common_name,omitempty"`
-	SANs        []string `json:"sans,omitempty"`
-	TLSVersion  string   `json:"tls_version,omitempty"`
-	ALPN        string   `json:"alpn,omitempty"`
-	H2OK        *bool    `json:"http2_ok,omitempty"`
-	CertOK      bool     `json:"cert_ok"`
-	Success     bool     `json:"success"`
-	Error       string   `json:"error,omitempty"`
-	RetriesUsed int      `json:"retries_used"`
-	Status      string   `json:"status"` // full|success|partial|failure
-	Icon        string   `json:"icon"`
+	Host        string
+	IP          string
+	RTTms       int
+	ASN         string
+	ASNName     string
+	ASNCountry  string
+	ASPrefix    string
+	CommonName  string
+	SANs        []string
+	TLSVersion  string
+	ALPN        string
+	H2OK        *bool
+	CertOK      bool
+	Success     bool
+	Error       string
+	RetriesUsed int
+	Status      string
+	Icon        string
 }
 
 // ASNInfo represents the WHOIS metadata for an IP address.
@@ -85,25 +86,25 @@ type ASNInfo struct {
 
 // Config mirrors the CLI flags.
 type Config struct {
-	Input    string
-	Threads  int
-	Timeout  time.Duration
-	Retries  int
-	OutPath  string
-	Verbose  bool
-	JSONL    bool
-	NoASN    bool
-	Port     string
-	SNI      string
-	ALPN     []string
-	MinTLS   string
-	MaxHosts int
+	Input   string
+	Threads int
+	Timeout time.Duration
+	Retries int
+	OutPath string
+	Verbose bool
+	NoASN   bool
+	Port    string
 }
 
-var (
+type checker struct {
+	cfg      Config
+	logger   *log.Logger
+	debug    *log.Logger
+	asnCache map[string]ASNInfo
 	asnMu    sync.Mutex
-	asnCache = map[string]ASNInfo{}
-)
+}
+
+var defaultALPN = []string{"h2", "http/1.1"}
 
 type ErrorKind string
 
@@ -119,6 +120,13 @@ const (
 type checkError struct {
 	kind ErrorKind
 	err  error
+}
+
+func (c *checker) debugf(format string, args ...interface{}) {
+	if c == nil || c.debug == nil {
+		return
+	}
+	c.debug.Printf(format, args...)
 }
 
 func (e *checkError) Error() string {
@@ -148,10 +156,6 @@ func main() {
 		fmt.Fprintln(os.Stderr, "fatal: no hosts to check")
 		os.Exit(1)
 	}
-	if cfg.MaxHosts > 0 && cfg.MaxHosts < len(hosts) {
-		hosts = hosts[:cfg.MaxHosts]
-	}
-
 	writer := io.Writer(os.Stdout)
 	if cfg.OutPath != "" {
 		f, err := os.Create(cfg.OutPath)
@@ -165,20 +169,14 @@ func main() {
 	logger := log.New(writer, "", 0)
 	logger.Printf("🔒 TLS Checker → %d hosts, %d workers, timeout=%s, retries=%d\n", len(hosts), cfg.Threads, cfg.Timeout, cfg.Retries)
 
-	results := runChecks(ctx, hosts, cfg, logger)
+	chk := newChecker(cfg, logger)
+	results := chk.runChecks(ctx, hosts)
 
-	if cfg.JSONL {
-		enc := json.NewEncoder(writer)
-		for _, r := range results {
-			_ = enc.Encode(r)
-		}
-	} else {
-		logger.Println("---------------------- RESULTS ----------------------")
-		for _, r := range results {
-			logger.Println(formatResult(r))
-		}
-		printSummary(results, len(hosts), logger)
+	logger.Println("---------------------- RESULTS ----------------------")
+	for _, r := range results {
+		logger.Println(formatResult(r))
 	}
+	printSummary(results, len(hosts), logger)
 
 	if cfg.OutPath != "" {
 		fmt.Fprintf(os.Stdout, "\nResults saved to '%s'.\n", cfg.OutPath)
@@ -191,6 +189,17 @@ func main() {
 	}
 }
 
+func newChecker(cfg Config, logger *log.Logger) *checker {
+	if cfg.Threads <= 0 {
+		cfg.Threads = 1
+	}
+	var dbg *log.Logger
+	if cfg.Verbose {
+		dbg = log.New(logger.Writer(), "[DEBUG] ", 0)
+	}
+	return &checker{cfg: cfg, logger: logger, debug: dbg, asnCache: make(map[string]ASNInfo)}
+}
+
 func parseFlags() Config {
 	var cfg Config
 	flag.StringVar(&cfg.Input, "i", "urls.txt", "input file with hosts/URLs")
@@ -199,70 +208,55 @@ func parseFlags() Config {
 	flag.IntVar(&cfg.Retries, "retries", 3, "retries per host on failure")
 	flag.StringVar(&cfg.OutPath, "o", "", "output file (optional)")
 	flag.BoolVar(&cfg.Verbose, "v", false, "verbose/debug output")
-	flag.BoolVar(&cfg.JSONL, "jsonl", false, "emit each result as JSONL")
 	flag.BoolVar(&cfg.NoASN, "no-asn", false, "disable ASN lookups")
 	flag.StringVar(&cfg.Port, "port", "443", "TCP port to connect")
-	flag.StringVar(&cfg.SNI, "sni", "", "override SNI (default host)")
-	alpn := flag.String("alpn", "h2,http/1.1", "comma separated ALPN to offer")
-	flag.StringVar(&cfg.MinTLS, "min-tls", "", "minimum TLS version: 1.2 or 1.3 (empty = default)")
-	flag.IntVar(&cfg.MaxHosts, "max-hosts", 0, "limit number of hosts processed (0 = all)")
 	flag.Parse()
 
-	cfg.ALPN = splitCSV(*alpn)
 	if cfg.Threads <= 0 {
 		cfg.Threads = 1
 	}
 	return cfg
 }
 
-func runChecks(ctx context.Context, hosts []string, cfg Config, logger *log.Logger) []Result {
-	jobs := make(chan string)
-	var wg sync.WaitGroup
-	results := make([]Result, 0, len(hosts))
-	var mu sync.Mutex
-
-	for i := 0; i < cfg.Threads; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case host, ok := <-jobs:
-					if !ok {
-						return
-					}
-					r := checkHost(ctx, host, cfg, logger)
-					mu.Lock()
-					results = append(results, r)
-					mu.Unlock()
-				}
-			}
-		}()
-	}
-
-	go func() {
-		defer close(jobs)
-		for _, host := range hosts {
+func (c *checker) runChecks(ctx context.Context, hosts []string) []Result {
+	g, ctx := errgroup.WithContext(ctx)
+	sem := make(chan struct{}, c.cfg.Threads)
+	var (
+		results = make([]Result, 0, len(hosts))
+		mu      sync.Mutex
+	)
+	for _, host := range hosts {
+		host := host
+		g.Go(func() error {
 			select {
+			case sem <- struct{}{}:
 			case <-ctx.Done():
-				return
-			case jobs <- host:
+				return ctx.Err()
 			}
-		}
-	}()
+			defer func() { <-sem }()
 
-	wg.Wait()
+			c.debugf("host=%s queued", host)
+			r := c.checkHost(ctx, host)
+			mu.Lock()
+			results = append(results, r)
+			mu.Unlock()
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil && !errors.Is(err, context.Canceled) {
+		c.logger.Printf("checks terminated early: %v", err)
+	}
 	sort.Slice(results, func(i, j int) bool { return results[i].Host < results[j].Host })
 	return results
 }
 
-func checkHost(ctx context.Context, host string, cfg Config, logger *log.Logger) Result {
+func (c *checker) checkHost(ctx context.Context, host string) Result {
 	res := Result{Host: host}
-	for attempt := 0; attempt <= cfg.Retries; attempt++ {
-		r, err := diagnose(ctx, host, cfg)
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
+		c.debugf("host=%s attempt=%d/%d starting", host, attempt+1, c.cfg.Retries+1)
+		r, err := c.diagnose(ctx, host)
 		if err == nil {
+			c.debugf("host=%s status=%s tls=%s alpn=%s h2=%v rtt=%dms", host, r.Status, r.TLSVersion, r.ALPN, boolPtr(r.H2OK), r.RTTms)
 			return r
 		}
 		res = r
@@ -270,10 +264,8 @@ func checkHost(ctx context.Context, host string, cfg Config, logger *log.Logger)
 		res.RetriesUsed = attempt
 		res.Success = false
 		res.Status, res.Icon = "failure", "❌"
-		if cfg.Verbose {
-			logger.Printf("[DEBUG] %s attempt %d failed: %s (%v)", host, attempt+1, res.Error, err)
-		}
-		if attempt == cfg.Retries {
+		c.debugf("host=%s attempt=%d failed err=%v", host, attempt+1, err)
+		if attempt == c.cfg.Retries {
 			break
 		}
 		backoff := time.Second * time.Duration(1<<attempt)
@@ -287,9 +279,9 @@ func checkHost(ctx context.Context, host string, cfg Config, logger *log.Logger)
 	return res
 }
 
-func diagnose(ctx context.Context, host string, cfg Config) (Result, error) {
+func (c *checker) diagnose(ctx context.Context, host string) (Result, error) {
 	res := Result{Host: host}
-	attemptCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
+	attemptCtx, cancel := context.WithTimeout(ctx, c.cfg.Timeout)
 	defer cancel()
 
 	ip, err := resolveOne(attemptCtx, host)
@@ -297,24 +289,27 @@ func diagnose(ctx context.Context, host string, cfg Config) (Result, error) {
 		return res, failure(ErrDNS, err)
 	}
 	res.IP = ip
+	c.debugf("host=%s resolved_ip=%s", host, ip)
 
-	if !cfg.NoASN {
-		asn := queryASNCymru(attemptCtx, ip)
+	if !c.cfg.NoASN {
+		asn := c.queryASN(attemptCtx, ip)
 		res.ASN, res.ASNName, res.ASNCountry, res.ASPrefix = asn.Number, asn.Name, asn.Country, asn.Prefix
 	}
 
 	start := time.Now()
-	state, alpn, tlsVer, certOK, err := dialTLS(attemptCtx, host, cfg, true)
+	state, alpn, tlsVer, certOK, err := c.dialTLS(attemptCtx, host, true)
 	if err != nil {
 		var verr *tls.CertificateVerificationError
 		if errors.As(err, &verr) {
-			state, alpn, tlsVer, certOK, err = dialTLS(attemptCtx, host, cfg, false)
+			c.debugf("host=%s strict TLS verify failed: %v (retrying insecure)", host, err)
+			state, alpn, tlsVer, certOK, err = c.dialTLS(attemptCtx, host, false)
 		}
 	}
 	if err != nil {
 		return res, failure(ErrTLS, err)
 	}
 	res.RTTms = int(time.Since(start).Milliseconds())
+	c.debugf("host=%s tls=%s alpn=%s certOK=%t rtt=%dms", host, tlsVer, alpn, certOK, res.RTTms)
 
 	if len(state.PeerCertificates) > 0 {
 		leaf := state.PeerCertificates[0]
@@ -330,8 +325,9 @@ func diagnose(ctx context.Context, host string, cfg Config) (Result, error) {
 	res.CertOK = certOK
 
 	if alpn == "h2" {
-		ok := h2ProbeXNet(attemptCtx, host, cfg)
+		ok := c.h2Probe(attemptCtx, host)
 		res.H2OK = &ok
+		c.debugf("host=%s h2_probe=%t", host, ok)
 	}
 
 	res.Success = true
@@ -353,22 +349,14 @@ func resolveOne(ctx context.Context, host string) (string, error) {
 	return ips[0].String(), nil
 }
 
-func dialTLS(ctx context.Context, host string, cfg Config, strict bool) (tls.ConnectionState, string, string, bool, error) {
-	min := uint16(0)
-	switch cfg.MinTLS {
-	case "1.3":
-		min = tls.VersionTLS13
-	case "1.2":
-		min = tls.VersionTLS12
-	}
+func (c *checker) dialTLS(ctx context.Context, host string, strict bool) (tls.ConnectionState, string, string, bool, error) {
 	tlsCfg := &tls.Config{
-		ServerName:         chooseSNI(cfg, host),
-		NextProtos:         cfg.ALPN,
-		MinVersion:         min,
+		ServerName:         host,
+		NextProtos:         defaultALPN,
 		InsecureSkipVerify: !strict,
 	}
 	d := &tls.Dialer{NetDialer: &net.Dialer{}, Config: tlsCfg}
-	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(host, cfg.Port))
+	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(host, c.cfg.Port))
 	if err != nil {
 		return tls.ConnectionState{}, "", "", false, err
 	}
@@ -381,10 +369,10 @@ func dialTLS(ctx context.Context, host string, cfg Config, strict bool) (tls.Con
 	return state, state.NegotiatedProtocol, tlsVersionString(state.Version), strict, nil
 }
 
-func h2ProbeXNet(ctx context.Context, host string, cfg Config) bool {
-	tlsCfg := &tls.Config{ServerName: chooseSNI(cfg, host), NextProtos: []string{"h2"}}
-	client := &http.Client{Transport: &http2.Transport{TLSClientConfig: tlsCfg}, Timeout: cfg.Timeout}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+net.JoinHostPort(host, cfg.Port)+"/", nil)
+func (c *checker) h2Probe(ctx context.Context, host string) bool {
+	tlsCfg := &tls.Config{ServerName: host, NextProtos: []string{"h2"}}
+	client := &http.Client{Transport: &http2.Transport{TLSClientConfig: tlsCfg}, Timeout: c.cfg.Timeout}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+net.JoinHostPort(host, c.cfg.Port)+"/", nil)
 	if err != nil {
 		return false
 	}
@@ -393,16 +381,17 @@ func h2ProbeXNet(ctx context.Context, host string, cfg Config) bool {
 		return false
 	}
 	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
 	return resp.ProtoMajor == 2
 }
 
-func queryASNCymru(ctx context.Context, ip string) ASNInfo {
-	asnMu.Lock()
-	if v, ok := asnCache[ip]; ok {
-		asnMu.Unlock()
+func (c *checker) queryASN(ctx context.Context, ip string) ASNInfo {
+	c.asnMu.Lock()
+	if v, ok := c.asnCache[ip]; ok {
+		c.asnMu.Unlock()
 		return v
 	}
-	asnMu.Unlock()
+	c.asnMu.Unlock()
 
 	info := ASNInfo{Number: "N/A", Prefix: "N/A", Country: "N/A", Name: "N/A"}
 	d := &net.Dialer{}
@@ -435,9 +424,9 @@ func queryASNCymru(ctx context.Context, ip string) ASNInfo {
 		}
 		break
 	}
-	asnMu.Lock()
-	asnCache[ip] = info
-	asnMu.Unlock()
+	c.asnMu.Lock()
+	c.asnCache[ip] = info
+	c.asnMu.Unlock()
 	return info
 }
 
@@ -568,53 +557,31 @@ func loadHosts(path string) ([]string, error) {
 }
 
 func isComment(s string) bool {
-	for _, prefix := range []string{"#", "//", ";", "--"} {
-		if strings.HasPrefix(s, prefix) {
-			return true
-		}
+	switch {
+	case strings.HasPrefix(s, "#"), strings.HasPrefix(s, "//"), strings.HasPrefix(s, ";"), strings.HasPrefix(s, "--"):
+		return true
+	default:
+		return false
 	}
-	return false
 }
 
 func extractHost(line string) (string, bool) {
-	cand := strings.TrimSpace(line)
-	if cand == "" {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
 		return "", false
 	}
-	if strings.Contains(cand, "://") {
-		parts := strings.SplitN(cand, "://", 2)
-		cand = parts[1]
-		if idx := strings.Index(cand, "/"); idx >= 0 {
-			cand = cand[:idx]
-		}
+	if !strings.Contains(trimmed, "://") {
+		trimmed = "https://" + trimmed
 	}
-	if strings.HasPrefix(cand, "[") {
-		if idx := strings.Index(cand, "]"); idx >= 0 {
-			cand = cand[:idx+1]
-		}
-	} else if idx := strings.LastIndex(cand, ":"); idx >= 0 && !strings.Contains(cand, "]") {
-		cand = cand[:idx]
-	}
-	cand = strings.Trim(cand, "[]")
-	if cand == "" {
+	u, err := url.Parse(trimmed)
+	if err != nil {
 		return "", false
 	}
-	return cand, true
-}
-
-func splitCSV(s string) []string {
-	if s == "" {
-		return nil
+	host := u.Hostname()
+	if host == "" {
+		return "", false
 	}
-	parts := strings.Split(s, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
+	return host, true
 }
 
 func tlsVersionString(v uint16) string {
@@ -657,9 +624,13 @@ func describeError(err error) string {
 	return string(ErrUnknown)
 }
 
-func chooseSNI(cfg Config, host string) string {
-	if cfg.SNI != "" {
-		return cfg.SNI
+func boolPtr(b *bool) string {
+	switch {
+	case b == nil:
+		return "n/a"
+	case *b:
+		return "true"
+	default:
+		return "false"
 	}
-	return host
 }
