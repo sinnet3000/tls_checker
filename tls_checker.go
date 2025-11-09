@@ -57,6 +57,7 @@ import (
 // Result captures one host diagnostic row.
 type Result struct {
 	Host        string
+	Port        string
 	IP          string
 	RTTms       int
 	ASN         string
@@ -92,6 +93,12 @@ type Config struct {
 	Verbose bool
 	NoASN   bool
 	Port    string
+}
+
+// HostSpec binds a host with the port it should be checked on.
+type HostSpec struct {
+	Host string
+	Port string
 }
 
 type checker struct {
@@ -146,12 +153,12 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	hosts, err := loadHosts(cfg.Input)
+	targets, err := loadHosts(cfg.Input, cfg.Port)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
 		os.Exit(1)
 	}
-	if len(hosts) == 0 {
+	if len(targets) == 0 {
 		fmt.Fprintln(os.Stderr, "fatal: no hosts to check")
 		os.Exit(1)
 	}
@@ -166,16 +173,17 @@ func main() {
 		writer = f
 	}
 	logger := log.New(writer, "", 0)
-	logger.Printf("🔒 TLS Checker → %d hosts, %d workers, timeout=%s, retries=%d\n", len(hosts), cfg.Threads, cfg.Timeout, cfg.Retries)
+	logger.Printf("🔒 TLS Checker → %d targets, %d workers, timeout=%s, retries=%d, ASN:%t, default port:%s\n",
+		len(targets), cfg.Threads, cfg.Timeout, cfg.Retries, !cfg.NoASN, cfg.Port)
 
 	chk := newChecker(cfg, logger)
-	results := chk.runChecks(ctx, hosts)
+	results := chk.runChecks(ctx, targets)
 
 	logger.Println("---------------------- RESULTS ----------------------")
 	for _, r := range results {
 		logger.Println(formatResult(r))
 	}
-	printSummary(results, len(hosts), logger)
+	printSummary(results, len(targets), logger)
 
 	if cfg.OutPath != "" {
 		fmt.Fprintf(os.Stdout, "\nResults saved to '%s'.\n", cfg.OutPath)
@@ -220,43 +228,49 @@ func parseFlags() Config {
 	return cfg
 }
 
-func (c *checker) runChecks(ctx context.Context, hosts []string) []Result {
+func (c *checker) runChecks(ctx context.Context, targets []HostSpec) []Result {
 	g, ctx := errgroup.WithContext(ctx)
 	g.SetLimit(c.cfg.Threads)
-	results := make([]Result, len(hosts))
-	for idx, host := range hosts {
-		idx, host := idx, host
+	results := make([]Result, len(targets))
+	for idx, target := range targets {
+		idx, target := idx, target
 		g.Go(func() error {
-			c.debugf("host=%s queued", host)
-			results[idx] = c.checkHost(ctx, host)
+			c.debugf("host=%s port=%s queued", target.Host, target.Port)
+			results[idx] = c.checkHost(ctx, target)
 			return nil
 		})
 	}
 	if err := g.Wait(); err != nil && !errors.Is(err, context.Canceled) {
 		c.logger.Printf("checks terminated early: %v", err)
 	}
-	sort.Slice(results, func(i, j int) bool { return results[i].Host < results[j].Host })
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].Host == results[j].Host {
+			return results[i].Port < results[j].Port
+		}
+		return results[i].Host < results[j].Host
+	})
 	return results
 }
 
-func (c *checker) checkHost(ctx context.Context, host string) Result {
-	res := Result{Host: host}
+func (c *checker) checkHost(ctx context.Context, target HostSpec) Result {
+	res := Result{Host: target.Host, Port: target.Port}
 	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
-		c.debugf("host=%s attempt=%d/%d starting", host, attempt+1, c.cfg.Retries+1)
-		r, err := c.diagnose(ctx, host)
+		c.debugf("host=%s port=%s attempt=%d/%d starting", target.Host, target.Port, attempt+1, c.cfg.Retries+1)
+		r, err := c.diagnose(ctx, target)
 		if err == nil {
 			if attempt > 0 {
 				r.RetriesUsed = attempt
 			}
 			status, _ := classify(&r)
-			c.debugf("host=%s status=%s tls=%s alpn=%s h2=%v rtt=%dms", host, status, r.TLSVersion, r.ALPN, boolPtr(r.H2OK), r.RTTms)
+			c.debugf("host=%s port=%s status=%s tls=%s alpn=%s h2=%v rtt=%dms",
+				target.Host, target.Port, status, r.TLSVersion, r.ALPN, boolPtr(r.H2OK), r.RTTms)
 			return r
 		}
 		res = r
 		res.Error = describeError(err)
 		res.RetriesUsed = attempt
 		res.Success = false
-		c.debugf("host=%s attempt=%d failed err=%v", host, attempt+1, err)
+		c.debugf("host=%s port=%s attempt=%d failed err=%v", target.Host, target.Port, attempt+1, err)
 		if attempt == c.cfg.Retries {
 			break
 		}
@@ -271,17 +285,17 @@ func (c *checker) checkHost(ctx context.Context, host string) Result {
 	return res
 }
 
-func (c *checker) diagnose(ctx context.Context, host string) (Result, error) {
-	res := Result{Host: host}
+func (c *checker) diagnose(ctx context.Context, target HostSpec) (Result, error) {
+	res := Result{Host: target.Host, Port: target.Port}
 	attemptCtx, cancel := context.WithTimeout(ctx, c.cfg.Timeout)
 	defer cancel()
 
-	ip, err := resolveOne(attemptCtx, host)
+	ip, err := resolveOne(attemptCtx, target.Host)
 	if err != nil {
 		return res, failure(ErrDNS, err)
 	}
 	res.IP = ip
-	c.debugf("host=%s resolved_ip=%s", host, ip)
+	c.debugf("host=%s port=%s resolved_ip=%s", target.Host, target.Port, ip)
 
 	if !c.cfg.NoASN {
 		asn := c.queryASN(attemptCtx, ip)
@@ -289,12 +303,12 @@ func (c *checker) diagnose(ctx context.Context, host string) (Result, error) {
 	}
 
 	start := time.Now()
-	state, alpn, tlsVer, certOK, err := c.dialTLSWithFallback(attemptCtx, host)
+	state, alpn, tlsVer, certOK, err := c.dialTLSWithFallback(attemptCtx, target)
 	if err != nil {
 		return res, failure(ErrTLS, err)
 	}
 	res.RTTms = int(time.Since(start).Milliseconds())
-	c.debugf("host=%s tls=%s alpn=%s certOK=%t rtt=%dms", host, tlsVer, alpn, certOK, res.RTTms)
+	c.debugf("host=%s port=%s tls=%s alpn=%s certOK=%t rtt=%dms", target.Host, target.Port, tlsVer, alpn, certOK, res.RTTms)
 
 	if len(state.PeerCertificates) > 0 {
 		leaf := state.PeerCertificates[0]
@@ -310,9 +324,9 @@ func (c *checker) diagnose(ctx context.Context, host string) (Result, error) {
 	res.CertOK = certOK
 
 	if alpn == "h2" {
-		ok := c.h2Probe(attemptCtx, host)
+		ok := c.h2Probe(attemptCtx, target)
 		res.H2OK = &ok
-		c.debugf("host=%s h2_probe=%t", host, ok)
+		c.debugf("host=%s port=%s h2_probe=%t", target.Host, target.Port, ok)
 	}
 
 	res.Success = true
@@ -333,14 +347,14 @@ func resolveOne(ctx context.Context, host string) (string, error) {
 	return ips[0].String(), nil
 }
 
-func (c *checker) dialTLS(ctx context.Context, host string, strict bool) (tls.ConnectionState, string, string, bool, error) {
+func (c *checker) dialTLS(ctx context.Context, target HostSpec, strict bool) (tls.ConnectionState, string, string, bool, error) {
 	tlsCfg := &tls.Config{
-		ServerName:         host,
+		ServerName:         target.Host,
 		NextProtos:         defaultALPN,
 		InsecureSkipVerify: !strict,
 	}
 	d := &tls.Dialer{NetDialer: &net.Dialer{}, Config: tlsCfg}
-	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(host, c.cfg.Port))
+	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(target.Host, target.Port))
 	if err != nil {
 		return tls.ConnectionState{}, "", "", false, err
 	}
@@ -353,23 +367,23 @@ func (c *checker) dialTLS(ctx context.Context, host string, strict bool) (tls.Co
 	return state, state.NegotiatedProtocol, tlsVersionString(state.Version), strict, nil
 }
 
-func (c *checker) dialTLSWithFallback(ctx context.Context, host string) (tls.ConnectionState, string, string, bool, error) {
-	state, alpn, tlsVer, certOK, err := c.dialTLS(ctx, host, true)
+func (c *checker) dialTLSWithFallback(ctx context.Context, target HostSpec) (tls.ConnectionState, string, string, bool, error) {
+	state, alpn, tlsVer, certOK, err := c.dialTLS(ctx, target, true)
 	if err == nil {
 		return state, alpn, tlsVer, certOK, nil
 	}
 	var verr *tls.CertificateVerificationError
 	if errors.As(err, &verr) {
-		c.debugf("host=%s strict TLS verify failed: %v (retrying insecure)", host, err)
-		return c.dialTLS(ctx, host, false)
+		c.debugf("host=%s port=%s strict TLS verify failed: %v (retrying insecure)", target.Host, target.Port, err)
+		return c.dialTLS(ctx, target, false)
 	}
 	return state, alpn, tlsVer, certOK, err
 }
 
-func (c *checker) h2Probe(ctx context.Context, host string) bool {
-	tlsCfg := &tls.Config{ServerName: host, NextProtos: []string{"h2"}}
+func (c *checker) h2Probe(ctx context.Context, target HostSpec) bool {
+	tlsCfg := &tls.Config{ServerName: target.Host, NextProtos: []string{"h2"}}
 	client := &http.Client{Transport: &http2.Transport{TLSClientConfig: tlsCfg}, Timeout: c.cfg.Timeout}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+net.JoinHostPort(host, c.cfg.Port)+"/", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+net.JoinHostPort(target.Host, target.Port)+"/", nil)
 	if err != nil {
 		return false
 	}
@@ -428,6 +442,10 @@ func (c *checker) queryASN(ctx context.Context, ip string) ASNInfo {
 }
 
 func formatResult(r Result) string {
+	endpoint := r.Host
+	if r.Port != "" {
+		endpoint = net.JoinHostPort(r.Host, r.Port)
+	}
 	val := func(s, fallback string) string {
 		if s == "" {
 			return fallback
@@ -466,7 +484,7 @@ func formatResult(r Result) string {
 	if r.Success {
 		_, icon := classify(&r)
 		return fmt.Sprintf("%s %s (%s) - RTT:%s | CN:%s | SANs:[%s] | ASN:%s (%s) | TLS:%s | ALPN:%s | H2:%s | Cert:%s%s",
-			icon, r.Host, val(r.IP, "N/A"), rtt, val(r.CommonName, "N/A"), strings.Join(sans, ", "),
+			icon, endpoint, val(r.IP, "N/A"), rtt, val(r.CommonName, "N/A"), strings.Join(sans, ", "),
 			val(r.ASN, "N/A"), val(r.ASNName, "N/A"), val(r.TLSVersion, "N/A"), val(r.ALPN, "none"), h2, cert, retry,
 		)
 	}
@@ -474,7 +492,7 @@ func formatResult(r Result) string {
 	if r.RetriesUsed > 0 {
 		note = fmt.Sprintf("Failed after %d attempts: %s", r.RetriesUsed+1, r.Error)
 	}
-	return fmt.Sprintf("❌ %s - FAILED (%s)", r.Host, note)
+	return fmt.Sprintf("❌ %s - FAILED (%s)", endpoint, note)
 }
 
 func printSummary(results []Result, total int, logger *log.Logger) {
@@ -524,7 +542,7 @@ func classify(r *Result) (string, string) {
 	return "partial", "🟡"
 }
 
-func loadHosts(path string) ([]string, error) {
+func loadHosts(path, defaultPort string) ([]HostSpec, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -532,27 +550,28 @@ func loadHosts(path string) ([]string, error) {
 	defer f.Close()
 	scanner := bufio.NewScanner(f)
 	seen := make(map[string]struct{})
-	var hosts []string
+	var targets []HostSpec
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || isComment(line) {
 			continue
 		}
-		host, ok := extractHost(line)
+		target, ok := extractHost(line, defaultPort)
 		if !ok {
 			continue
 		}
-		if _, dup := seen[host]; dup {
+		key := target.Host + ":" + target.Port
+		if _, dup := seen[key]; dup {
 			continue
 		}
-		seen[host] = struct{}{}
-		hosts = append(hosts, host)
+		seen[key] = struct{}{}
+		targets = append(targets, target)
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
-	fmt.Fprintf(os.Stdout, "📋 Found %d unique hosts to check.\n", len(hosts))
-	return hosts, nil
+	fmt.Fprintf(os.Stdout, "📋 Found %d unique host:port targets to check.\n", len(targets))
+	return targets, nil
 }
 
 func isComment(s string) bool {
@@ -564,23 +583,27 @@ func isComment(s string) bool {
 	}
 }
 
-func extractHost(line string) (string, bool) {
+func extractHost(line, defaultPort string) (HostSpec, bool) {
 	trimmed := strings.TrimSpace(line)
 	if trimmed == "" {
-		return "", false
+		return HostSpec{}, false
 	}
 	if !strings.Contains(trimmed, "://") {
 		trimmed = "https://" + trimmed
 	}
 	u, err := url.Parse(trimmed)
 	if err != nil {
-		return "", false
+		return HostSpec{}, false
 	}
 	host := u.Hostname()
 	if host == "" {
-		return "", false
+		return HostSpec{}, false
 	}
-	return host, true
+	port := u.Port()
+	if port == "" {
+		port = defaultPort
+	}
+	return HostSpec{Host: host, Port: port}, true
 }
 
 func tlsVersionString(v uint16) string {
