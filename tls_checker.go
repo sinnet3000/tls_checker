@@ -72,8 +72,6 @@ type Result struct {
 	Success     bool
 	Error       string
 	RetriesUsed int
-	Status      string
-	Icon        string
 }
 
 // ASNInfo represents the WHOIS metadata for an IP address.
@@ -101,7 +99,9 @@ type checker struct {
 	logger   *log.Logger
 	debug    *log.Logger
 	asnCache map[string]ASNInfo
-	asnMu    sync.Mutex
+	asnMu    sync.RWMutex
+	rng      *rand.Rand
+	rngMu    sync.Mutex
 }
 
 var defaultALPN = []string{"h2", "http/1.1"}
@@ -142,7 +142,6 @@ func failure(kind ErrorKind, err error) error { return &checkError{kind: kind, e
 
 func main() {
 	cfg := parseFlags()
-	rand.Seed(time.Now().UnixNano())
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -183,21 +182,24 @@ func main() {
 	}
 
 	for _, r := range results {
-		if r.Status == "failure" {
+		if !r.Success {
 			os.Exit(2)
 		}
 	}
 }
 
 func newChecker(cfg Config, logger *log.Logger) *checker {
-	if cfg.Threads <= 0 {
-		cfg.Threads = 1
-	}
 	var dbg *log.Logger
 	if cfg.Verbose {
 		dbg = log.New(logger.Writer(), "[DEBUG] ", 0)
 	}
-	return &checker{cfg: cfg, logger: logger, debug: dbg, asnCache: make(map[string]ASNInfo)}
+	return &checker{
+		cfg:      cfg,
+		logger:   logger,
+		debug:    dbg,
+		asnCache: make(map[string]ASNInfo),
+		rng:      rand.New(rand.NewSource(time.Now().UnixNano())),
+	}
 }
 
 func parseFlags() Config {
@@ -220,26 +222,13 @@ func parseFlags() Config {
 
 func (c *checker) runChecks(ctx context.Context, hosts []string) []Result {
 	g, ctx := errgroup.WithContext(ctx)
-	sem := make(chan struct{}, c.cfg.Threads)
-	var (
-		results = make([]Result, 0, len(hosts))
-		mu      sync.Mutex
-	)
-	for _, host := range hosts {
-		host := host
+	g.SetLimit(c.cfg.Threads)
+	results := make([]Result, len(hosts))
+	for idx, host := range hosts {
+		idx, host := idx, host
 		g.Go(func() error {
-			select {
-			case sem <- struct{}{}:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-			defer func() { <-sem }()
-
 			c.debugf("host=%s queued", host)
-			r := c.checkHost(ctx, host)
-			mu.Lock()
-			results = append(results, r)
-			mu.Unlock()
+			results[idx] = c.checkHost(ctx, host)
 			return nil
 		})
 	}
@@ -256,20 +245,20 @@ func (c *checker) checkHost(ctx context.Context, host string) Result {
 		c.debugf("host=%s attempt=%d/%d starting", host, attempt+1, c.cfg.Retries+1)
 		r, err := c.diagnose(ctx, host)
 		if err == nil {
-			c.debugf("host=%s status=%s tls=%s alpn=%s h2=%v rtt=%dms", host, r.Status, r.TLSVersion, r.ALPN, boolPtr(r.H2OK), r.RTTms)
+			status, _ := classify(&r)
+			c.debugf("host=%s status=%s tls=%s alpn=%s h2=%v rtt=%dms", host, status, r.TLSVersion, r.ALPN, boolPtr(r.H2OK), r.RTTms)
 			return r
 		}
 		res = r
 		res.Error = describeError(err)
 		res.RetriesUsed = attempt
 		res.Success = false
-		res.Status, res.Icon = "failure", "❌"
 		c.debugf("host=%s attempt=%d failed err=%v", host, attempt+1, err)
 		if attempt == c.cfg.Retries {
 			break
 		}
 		backoff := time.Second * time.Duration(1<<attempt)
-		jitter := time.Millisecond * time.Duration(rand.Intn(1000))
+		jitter := time.Millisecond * time.Duration(c.nextJitter(1000))
 		select {
 		case <-time.After(backoff + jitter):
 		case <-ctx.Done():
@@ -297,14 +286,7 @@ func (c *checker) diagnose(ctx context.Context, host string) (Result, error) {
 	}
 
 	start := time.Now()
-	state, alpn, tlsVer, certOK, err := c.dialTLS(attemptCtx, host, true)
-	if err != nil {
-		var verr *tls.CertificateVerificationError
-		if errors.As(err, &verr) {
-			c.debugf("host=%s strict TLS verify failed: %v (retrying insecure)", host, err)
-			state, alpn, tlsVer, certOK, err = c.dialTLS(attemptCtx, host, false)
-		}
-	}
+	state, alpn, tlsVer, certOK, err := c.dialTLSWithFallback(attemptCtx, host)
 	if err != nil {
 		return res, failure(ErrTLS, err)
 	}
@@ -331,7 +313,6 @@ func (c *checker) diagnose(ctx context.Context, host string) (Result, error) {
 	}
 
 	res.Success = true
-	res.Status, res.Icon = classify(&res)
 	return res, nil
 }
 
@@ -369,6 +350,19 @@ func (c *checker) dialTLS(ctx context.Context, host string, strict bool) (tls.Co
 	return state, state.NegotiatedProtocol, tlsVersionString(state.Version), strict, nil
 }
 
+func (c *checker) dialTLSWithFallback(ctx context.Context, host string) (tls.ConnectionState, string, string, bool, error) {
+	state, alpn, tlsVer, certOK, err := c.dialTLS(ctx, host, true)
+	if err == nil {
+		return state, alpn, tlsVer, certOK, nil
+	}
+	var verr *tls.CertificateVerificationError
+	if errors.As(err, &verr) {
+		c.debugf("host=%s strict TLS verify failed: %v (retrying insecure)", host, err)
+		return c.dialTLS(ctx, host, false)
+	}
+	return state, alpn, tlsVer, certOK, err
+}
+
 func (c *checker) h2Probe(ctx context.Context, host string) bool {
 	tlsCfg := &tls.Config{ServerName: host, NextProtos: []string{"h2"}}
 	client := &http.Client{Transport: &http2.Transport{TLSClientConfig: tlsCfg}, Timeout: c.cfg.Timeout}
@@ -386,12 +380,12 @@ func (c *checker) h2Probe(ctx context.Context, host string) bool {
 }
 
 func (c *checker) queryASN(ctx context.Context, ip string) ASNInfo {
-	c.asnMu.Lock()
+	c.asnMu.RLock()
 	if v, ok := c.asnCache[ip]; ok {
-		c.asnMu.Unlock()
+		c.asnMu.RUnlock()
 		return v
 	}
-	c.asnMu.Unlock()
+	c.asnMu.RUnlock()
 
 	info := ASNInfo{Number: "N/A", Prefix: "N/A", Country: "N/A", Name: "N/A"}
 	d := &net.Dialer{}
@@ -467,8 +461,9 @@ func formatResult(r Result) string {
 		retry = fmt.Sprintf(" (Recovered after %d %s)", r.RetriesUsed, word)
 	}
 	if r.Success {
+		_, icon := classify(&r)
 		return fmt.Sprintf("%s %s (%s) - RTT:%s | CN:%s | SANs:[%s] | ASN:%s (%s) | TLS:%s | ALPN:%s | H2:%s | Cert:%s%s",
-			r.Icon, r.Host, val(r.IP, "N/A"), rtt, val(r.CommonName, "N/A"), strings.Join(sans, ", "),
+			icon, r.Host, val(r.IP, "N/A"), rtt, val(r.CommonName, "N/A"), strings.Join(sans, ", "),
 			val(r.ASN, "N/A"), val(r.ASNName, "N/A"), val(r.TLSVersion, "N/A"), val(r.ALPN, "none"), h2, cert, retry,
 		)
 	}
@@ -484,11 +479,12 @@ func printSummary(results []Result, total int, logger *log.Logger) {
 	recovered := 0
 	breakdown := map[string]int{}
 	for _, r := range results {
-		counts[r.Status]++
+		status, _ := classify(&r)
+		counts[status]++
 		if r.Success && r.RetriesUsed > 0 {
 			recovered++
 		}
-		if r.Status == "failure" {
+		if status == "failure" {
 			breakdown[r.Error]++
 		}
 	}
@@ -633,4 +629,10 @@ func boolPtr(b *bool) string {
 	default:
 		return "false"
 	}
+}
+
+func (c *checker) nextJitter(max int) int {
+	c.rngMu.Lock()
+	defer c.rngMu.Unlock()
+	return c.rng.Intn(max)
 }
