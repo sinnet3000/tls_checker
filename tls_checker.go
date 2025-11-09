@@ -245,6 +245,9 @@ func (c *checker) checkHost(ctx context.Context, host string) Result {
 		c.debugf("host=%s attempt=%d/%d starting", host, attempt+1, c.cfg.Retries+1)
 		r, err := c.diagnose(ctx, host)
 		if err == nil {
+			if attempt > 0 {
+				r.RetriesUsed = attempt
+			}
 			status, _ := classify(&r)
 			c.debugf("host=%s status=%s tls=%s alpn=%s h2=%v rtt=%dms", host, status, r.TLSVersion, r.ALPN, boolPtr(r.H2OK), r.RTTms)
 			return r
