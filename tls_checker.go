@@ -53,14 +53,6 @@ import (
 	"golang.org/x/net/http2"
 )
 
-// ProbeMode controls how we verify HTTP/2 support once ALPN negotiates h2.
-type ProbeMode string
-
-const (
-	ProbeRaw  ProbeMode = "raw"
-	ProbeXNet ProbeMode = "xnet"
-)
-
 // Result captures one host diagnostic row.
 type Result struct {
 	Host        string   `json:"host"`
@@ -104,7 +96,6 @@ type Config struct {
 	Port     string
 	SNI      string
 	ALPN     []string
-	Probe    ProbeMode
 	MinTLS   string
 	MaxHosts int
 }
@@ -172,7 +163,7 @@ func main() {
 		writer = f
 	}
 	logger := log.New(writer, "", 0)
-	logger.Printf("🔒 TLS Checker → %d hosts, %d workers, timeout=%s, retries=%d, probe=%s\n", len(hosts), cfg.Threads, cfg.Timeout, cfg.Retries, cfg.Probe)
+	logger.Printf("🔒 TLS Checker → %d hosts, %d workers, timeout=%s, retries=%d\n", len(hosts), cfg.Threads, cfg.Timeout, cfg.Retries)
 
 	results := runChecks(ctx, hosts, cfg, logger)
 
@@ -213,18 +204,11 @@ func parseFlags() Config {
 	flag.StringVar(&cfg.Port, "port", "443", "TCP port to connect")
 	flag.StringVar(&cfg.SNI, "sni", "", "override SNI (default host)")
 	alpn := flag.String("alpn", "h2,http/1.1", "comma separated ALPN to offer")
-	probe := flag.String("h2-probe", string(ProbeRaw), "HTTP/2 probe: raw|xnet")
 	flag.StringVar(&cfg.MinTLS, "min-tls", "", "minimum TLS version: 1.2 or 1.3 (empty = default)")
 	flag.IntVar(&cfg.MaxHosts, "max-hosts", 0, "limit number of hosts processed (0 = all)")
 	flag.Parse()
 
 	cfg.ALPN = splitCSV(*alpn)
-	switch ProbeMode(*probe) {
-	case ProbeXNet:
-		cfg.Probe = ProbeXNet
-	default:
-		cfg.Probe = ProbeRaw
-	}
 	if cfg.Threads <= 0 {
 		cfg.Threads = 1
 	}
@@ -346,13 +330,7 @@ func diagnose(ctx context.Context, host string, cfg Config) (Result, error) {
 	res.CertOK = certOK
 
 	if alpn == "h2" {
-		ok := false
-		switch cfg.Probe {
-		case ProbeXNet:
-			ok = h2ProbeXNet(attemptCtx, host, cfg)
-		default:
-			ok = h2ProbeRaw(attemptCtx, host, cfg)
-		}
+		ok := h2ProbeXNet(attemptCtx, host, cfg)
 		res.H2OK = &ok
 	}
 
@@ -403,38 +381,10 @@ func dialTLS(ctx context.Context, host string, cfg Config, strict bool) (tls.Con
 	return state, state.NegotiatedProtocol, tlsVersionString(state.Version), strict, nil
 }
 
-func h2ProbeRaw(ctx context.Context, host string, cfg Config) bool {
-	tlsCfg := &tls.Config{ServerName: chooseSNI(cfg, host), NextProtos: []string{"h2"}}
-	d := &tls.Dialer{NetDialer: &net.Dialer{}, Config: tlsCfg}
-	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(host, cfg.Port))
-	if err != nil {
-		return false
-	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(cfg.Timeout))
-	preface := []byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
-	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
-	if _, err := conn.Write(append(preface, settings...)); err != nil {
-		return false
-	}
-	hdr := make([]byte, 9)
-	if _, err := io.ReadFull(conn, hdr); err != nil {
-		return false
-	}
-	length := int(hdr[0])<<16 | int(hdr[1])<<8 | int(hdr[2])
-	if length > 0 {
-		buf := make([]byte, length)
-		if _, err := io.ReadFull(conn, buf); err != nil {
-			return false
-		}
-	}
-	return hdr[3] == 0x04
-}
-
 func h2ProbeXNet(ctx context.Context, host string, cfg Config) bool {
 	tlsCfg := &tls.Config{ServerName: chooseSNI(cfg, host), NextProtos: []string{"h2"}}
 	client := &http.Client{Transport: &http2.Transport{TLSClientConfig: tlsCfg}, Timeout: cfg.Timeout}
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, "https://"+net.JoinHostPort(host, cfg.Port)+"/", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+net.JoinHostPort(host, cfg.Port)+"/", nil)
 	if err != nil {
 		return false
 	}
