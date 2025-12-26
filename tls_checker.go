@@ -324,7 +324,7 @@ func (c *checker) diagnose(ctx context.Context, target HostSpec) (Result, error)
 	res.CertOK = certOK
 
 	if alpn == "h2" {
-		ok := c.h2Probe(attemptCtx, target)
+		ok := c.h2Probe(attemptCtx, target, certOK)
 		res.H2OK = &ok
 		c.debugf("host=%s port=%s h2_probe=%t", target.Host, target.Port, ok)
 	}
@@ -380,8 +380,12 @@ func (c *checker) dialTLSWithFallback(ctx context.Context, target HostSpec) (tls
 	return state, alpn, tlsVer, certOK, err
 }
 
-func (c *checker) h2Probe(ctx context.Context, target HostSpec) bool {
-	tlsCfg := &tls.Config{ServerName: target.Host, NextProtos: []string{"h2"}}
+func (c *checker) h2Probe(ctx context.Context, target HostSpec, certOK bool) bool {
+	tlsCfg := &tls.Config{
+		ServerName:         target.Host,
+		NextProtos:         []string{"h2"},
+		InsecureSkipVerify: !certOK,
+	}
 	client := &http.Client{Transport: &http2.Transport{TLSClientConfig: tlsCfg}, Timeout: c.cfg.Timeout}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+net.JoinHostPort(target.Host, target.Port)+"/", nil)
 	if err != nil {
