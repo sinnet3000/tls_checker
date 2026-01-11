@@ -51,6 +51,6 @@ A legacy Python version of a similar tool can be found in the `legacy/` folder. 
 
 ## License
 
-This project is licensed under the AGPL-3.0 License; see the [LICENSE](LICENSE) file for details.
+This project is licensed under the AGPL-3.0 License - see the [LICENSE](LICENSE) file for details.
 
 Copyright (c) 2025 Luis Colunga (@sinnet3000)

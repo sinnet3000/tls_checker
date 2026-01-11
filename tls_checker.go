@@ -290,6 +290,13 @@ func (c *checker) diagnose(ctx context.Context, target HostSpec) (Result, error)
 	attemptCtx, cancel := context.WithTimeout(ctx, c.cfg.Timeout)
 	defer cancel()
 
+	if target.Host == "" {
+		return res, errors.New("empty host")
+	}
+	if target.Port == "" {
+		return res, errors.New("empty port")
+	}
+
 	ip, err := resolveOne(attemptCtx, target.Host)
 	if err != nil {
 		return res, failure(ErrDNS, err)
@@ -324,7 +331,7 @@ func (c *checker) diagnose(ctx context.Context, target HostSpec) (Result, error)
 	res.CertOK = certOK
 
 	if alpn == "h2" {
-		ok := c.h2Probe(attemptCtx, target)
+		ok := c.h2Probe(attemptCtx, target, certOK)
 		res.H2OK = &ok
 		c.debugf("host=%s port=%s h2_probe=%t", target.Host, target.Port, ok)
 	}
@@ -343,6 +350,11 @@ func resolveOne(ctx context.Context, host string) (string, error) {
 	}
 	if len(ips) == 0 {
 		return "", errors.New("no IPs returned")
+	}
+	for _, ip := range ips {
+		if v4 := ip.To4(); v4 != nil {
+			return v4.String(), nil
+		}
 	}
 	return ips[0].String(), nil
 }
@@ -380,8 +392,12 @@ func (c *checker) dialTLSWithFallback(ctx context.Context, target HostSpec) (tls
 	return state, alpn, tlsVer, certOK, err
 }
 
-func (c *checker) h2Probe(ctx context.Context, target HostSpec) bool {
-	tlsCfg := &tls.Config{ServerName: target.Host, NextProtos: []string{"h2"}}
+func (c *checker) h2Probe(ctx context.Context, target HostSpec, certOK bool) bool {
+	tlsCfg := &tls.Config{
+		ServerName:         target.Host,
+		NextProtos:         []string{"h2"},
+		InsecureSkipVerify: !certOK,
+	}
 	client := &http.Client{Transport: &http2.Transport{TLSClientConfig: tlsCfg}, Timeout: c.cfg.Timeout}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+net.JoinHostPort(target.Host, target.Port)+"/", nil)
 	if err != nil {
@@ -549,6 +565,8 @@ func loadHosts(path, defaultPort string) ([]HostSpec, error) {
 	}
 	defer f.Close()
 	scanner := bufio.NewScanner(f)
+	// Allow reasonably long input lines (bufio.Scanner defaults to 64K).
+	scanner.Buffer(make([]byte, 1024), 1024*1024)
 	seen := make(map[string]struct{})
 	var targets []HostSpec
 	for scanner.Scan() {
@@ -588,6 +606,9 @@ func extractHost(line, defaultPort string) (HostSpec, bool) {
 	if trimmed == "" {
 		return HostSpec{}, false
 	}
+	if ip := net.ParseIP(trimmed); ip != nil {
+		return HostSpec{Host: trimmed, Port: defaultPort}, true
+	}
 	if !strings.Contains(trimmed, "://") {
 		trimmed = "https://" + trimmed
 	}
@@ -625,16 +646,16 @@ func describeError(err error) string {
 	if err == nil {
 		return string(ErrUnknown)
 	}
-	var ce *checkError
-	if errors.As(err, &ce) {
-		return string(ce.kind)
-	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return string(ErrTimeout)
 	}
 	var ne net.Error
 	if errors.As(err, &ne) && ne.Timeout() {
 		return string(ErrTimeout)
+	}
+	var ce *checkError
+	if errors.As(err, &ce) {
+		return string(ce.kind)
 	}
 	msg := err.Error()
 	switch {
@@ -658,6 +679,9 @@ func boolPtr(b *bool) string {
 }
 
 func (c *checker) nextJitter(max int) int {
+	if max <= 0 {
+		return 0
+	}
 	c.rngMu.Lock()
 	defer c.rngMu.Unlock()
 	return c.rng.Intn(max)
