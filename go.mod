@@ -1,6 +1,6 @@
 module tls_checker
 
-go 1.25.4
+go 1.26.1
 
 require golang.org/x/net v0.46.0
 

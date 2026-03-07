@@ -2,11 +2,10 @@
 BINARY=tls_checker
 
 # Version information
-VERSION=0.10.0
-BUILD_TIME=$(shell date +%FT%T%z)
+VERSION=$(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 
 # Build flags
-LDFLAGS=-ldflags "-X main.version=${VERSION}"
+LDFLAGS=-ldflags "-X tls_checker/internal/version.Version=$(VERSION)"
 
 # Platforms
 PLATFORMS=linux/amd64 linux/arm64 linux/arm darwin/amd64 darwin/arm64 windows/amd64
@@ -14,7 +13,7 @@ PLATFORMS=linux/amd64 linux/arm64 linux/arm darwin/amd64 darwin/arm64 windows/am
 # Output directories
 DIST_DIR=bin
 
-.PHONY: all clean help
+.PHONY: all clean help build install
 
 all: clean build
 
@@ -32,6 +31,12 @@ build:
 	done
 	@echo "Build complete! Binaries are in ${DIST_DIR}/"
 
+install:
+	@if [ -z "$(HOME)" ]; then echo "error: HOME is not set" >&2; exit 1; fi
+	@mkdir -p "$(HOME)/.local/bin"
+	go build ${LDFLAGS} -o "$(HOME)/.local/bin/${BINARY}" .
+	@echo "Installed to ~/.local/bin/${BINARY}"
+
 clean:
 	@rm -rf ${DIST_DIR}
 	@echo "Cleaned ${DIST_DIR}/ directory"
@@ -41,7 +46,6 @@ help:
 	@echo "Available targets:"
 	@echo "  all      - Clean and build all binaries (default)"
 	@echo "  build    - Build binaries for all platforms"
+	@echo "  install  - Build and install to ~/.local/bin"
 	@echo "  clean    - Remove build artifacts"
 	@echo "  help     - Show this help message"
-
-

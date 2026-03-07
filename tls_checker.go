@@ -52,6 +52,9 @@ import (
 
 	"golang.org/x/net/http2"
 	"golang.org/x/sync/errgroup"
+
+	"tls_checker/internal/update"
+	"tls_checker/internal/version"
 )
 
 // Result captures one host diagnostic row.
@@ -148,7 +151,20 @@ func (e *checkError) Unwrap() error { return e.err }
 func failure(kind ErrorKind, err error) error { return &checkError{kind: kind, err: err} }
 
 func main() {
+	showVersion := flag.Bool("version", false, "Show version and exit")
+	doUpdate := flag.Bool("update", false, "Update to the latest version")
+
 	cfg := parseFlags()
+
+	if *showVersion {
+		fmt.Printf("tls_checker %s\n", version.Version)
+		return
+	}
+
+	if *doUpdate {
+		runUpdate()
+		return
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -212,7 +228,7 @@ func newChecker(cfg Config, logger *log.Logger) *checker {
 
 func parseFlags() Config {
 	var cfg Config
-	flag.StringVar(&cfg.Input, "i", "urls.txt", "input file with hosts/URLs")
+	flag.StringVar(&cfg.Input, "i", "example_urls.txt", "input file with hosts/URLs")
 	flag.IntVar(&cfg.Threads, "t", 12, "concurrent workers")
 	flag.DurationVar(&cfg.Timeout, "timeout", 5*time.Second, "per-connection timeout")
 	flag.IntVar(&cfg.Retries, "retries", 3, "retries per host on failure")
@@ -685,4 +701,40 @@ func (c *checker) nextJitter(max int) int {
 	c.rngMu.Lock()
 	defer c.rngMu.Unlock()
 	return c.rng.Intn(max)
+}
+
+func runUpdate() {
+	fmt.Println("Checking for updates...")
+
+	info, err := update.CheckForUpdate()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	if info == nil {
+		fmt.Printf("Already running latest version (%s)\n", version.Version)
+		return
+	}
+
+	fmt.Printf("\n  Current version: %s\n", info.CurrentVersion)
+	fmt.Printf("  Latest version:  %s\n", info.LatestVersion)
+	fmt.Printf("\n  Download: %s\n", info.DownloadURL)
+	fmt.Printf("  Size:     %s\n", update.FormatSize(info.Size))
+
+	fmt.Print("\nProceed with update? [y/N] ")
+	var response string
+	fmt.Scanln(&response)
+	if strings.ToLower(response) != "y" && strings.ToLower(response) != "yes" {
+		fmt.Println("Update cancelled")
+		return
+	}
+
+	fmt.Println()
+	if err := update.PerformUpdate(info); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Updated to %s\n", info.LatestVersion)
 }
