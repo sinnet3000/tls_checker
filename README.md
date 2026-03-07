@@ -15,28 +15,36 @@ A Go-based command-line tool for concurrent TLS diagnostics, designed to check a
 -   **Resilience:** Includes retries with exponential backoff and jitter for robust checking.
 -   **Output:** Provides text-only output to stdout or a specified file.
 
-## Build
+## Installation
 
-To build the `tls_checker` executable, use the provided `Makefile`:
+### Quick Install (macOS / Linux)
 
-```bash
-make build
+```sh
+curl -fsSL https://raw.githubusercontent.com/sinnet3000/tls_checker/main/scripts/install.sh | bash
 ```
 
-This will create platform-specific binaries in the `bin/` directory.
+### Build from Source
+
+```sh
+git clone https://github.com/sinnet3000/tls_checker.git
+cd tls_checker
+make install
+```
+
+Requires **Go** 1.22.5 or newer. Installs to `~/.local/bin/`.
+
+---
 
 ## Usage
 
-The tool expects an input file with a list of hosts or URLs. By default, it looks for `urls.txt`.
-
 ```bash
-./bin/tls_checker_[OS]_[ARCH] -i urls.txt -t 16 --timeout 5s --retries 2
-./bin/tls_checker_[OS]_[ARCH] -i urls.txt --no-asn -o output.txt
+tls_checker -i example_urls.txt -t 16 --timeout 5s --retries 2
+tls_checker -i example_urls.txt --no-asn -o output.txt
 ```
 
 ### Flags:
 
--   `-i <file>`: Input file with hosts/URLs (default: `urls.txt`).
+-   `-i <file>`: Input file with hosts/URLs (default: `example_urls.txt`).
 -   `-t <int>`: Concurrent workers (default: `12`).
 -   `--timeout <duration>`: Per-connection timeout (default: `5s`).
 -   `--retries <int>`: Retries per host on failure (default: `3`).
@@ -45,12 +53,17 @@ The tool expects an input file with a list of hosts or URLs. By default, it look
 -   `--no-asn`: Disable ASN lookups.
 -   `--port <port>`: TCP port to connect (default: `443`).
 
-## Legacy Python Version
+### Other Flags
 
-A legacy Python version of a similar tool can be found in the `legacy/` folder. This Go version aims to provide improved performance and concurrency.
+```sh
+tls_checker -version   # Show version
+tls_checker -update    # Self-update to latest release
+```
+
+---
 
 ## License
 
-This project is licensed under the AGPL-3.0 License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the AGPL-3.0 License; see the [LICENSE](LICENSE) file for details.
 
 Copyright (c) 2025 Luis Colunga (@sinnet3000)
