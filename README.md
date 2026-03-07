@@ -31,7 +31,7 @@ cd tls_checker
 make install
 ```
 
-Requires **Go** 1.22.5 or newer. Installs to `~/.local/bin/`.
+Requires **Go** 1.26.1 or newer. Installs to `~/.local/bin/`.
 
 ---
 
@@ -40,6 +40,23 @@ Requires **Go** 1.22.5 or newer. Installs to `~/.local/bin/`.
 ```bash
 tls_checker -i example_urls.txt -t 16 --timeout 5s --retries 2
 tls_checker -i example_urls.txt --no-asn -o output.txt
+```
+
+### Example Output (Simulated)
+
+```text
+📋 Found 4 unique host:port targets to check.
+🔒 TLS Checker → 4 targets, 12 workers, timeout=5s, retries=2, ASN:true, default port:443
+---------------------- RESULTS ----------------------
+🔵 cloudflare.com:443 (104.16.132.229) - RTT:41ms | CN:cloudflare.com | SANs:[cloudflare.com, sni.cloudflaressl.com] | ASN:13335 (CLOUDFLARENET) | TLS:TLS1.3 | ALPN:h2 | H2:ok | Cert:ok
+🟢 example.com:443 (93.184.216.34) - RTT:58ms | CN:*.example.com | SANs:[*.example.com, example.com] | ASN:15133 (EDGECAST) | TLS:TLS1.3 | ALPN:http/1.1 | H2:n/a | Cert:ok
+🟡 legacy.example.net:443 (198.51.100.20) - RTT:77ms | CN:legacy.example.net | SANs:[legacy.example.net] | ASN:64500 (LEGACY-NET) | TLS:TLS1.2 | ALPN:http/1.1 | H2:n/a | Cert:ok
+❌ broken.example.org:443 - FAILED (TLS_HANDSHAKE_FAILED)
+
+-------------------- SUMMARY --------------------
+Hosts Checked: 4/4
+🔵 Full: 1 | 🟢 Success: 1 | 🟡 Partial: 1 | ❌ Failure: 1
+-------------------------------------------------
 ```
 
 ### Flags:
