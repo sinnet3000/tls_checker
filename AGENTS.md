@@ -1,65 +1,21 @@
-# Coding Guidelines
+# Agent Instructions
 
-Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
+## Project
 
-**Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
+A Go CLI for TLS, ALPN, HTTP/2, and ASN diagnostics. See `README.md` for flags and `go.mod` for the Go version.
 
-## 1. Think Before Coding
+## Working Guidelines
 
-**Don't assume. Don't hide confusion. Surface tradeoffs.**
+- Inspect the repository to resolve uncertainty before asking the user.
+- Make reasonable, reversible assumptions and state those that affect the result. Ask when an unresolved decision materially affects scope, correctness, or an irreversible action.
+- Prefer the smallest clear implementation that meets the requirements. Add abstractions, configuration, and defensive handling when justified by actual behavior or requirements.
+- Keep changes within the requested scope and match existing style. Avoid unrelated refactoring, formatting, or cleanup.
+- Remove imports, variables, and functions made unused by your changes. Mention unrelated issues without expanding the task to fix them.
+- For multi-step work, state a brief plan with verifiable outcomes. Verify the changed behavior and report any checks you could not complete.
 
-Before implementing:
-- State your assumptions explicitly. If uncertain, ask.
-- If multiple interpretations exist, present them - don't pick silently.
-- If a simpler approach exists, say so. Push back when warranted.
-- If something is unclear, stop. Name what's confusing. Ask.
+## Development and Verification
 
-## 2. Simplicity First
-
-**Minimum code that solves the problem. Nothing speculative.**
-
-- No features beyond what was asked.
-- No abstractions for single-use code.
-- No "flexibility" or "configurability" that wasn't requested.
-- No error handling for impossible scenarios.
-- If you write 200 lines and it could be 50, rewrite it.
-
-Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
-
-## 3. Surgical Changes
-
-**Touch only what you must. Clean up only your own mess.**
-
-When editing existing code:
-- Don't "improve" adjacent code, comments, or formatting.
-- Don't refactor things that aren't broken.
-- Match existing style, even if you'd do it differently.
-- If you notice unrelated dead code, mention it - don't delete it.
-
-When your changes create orphans:
-- Remove imports/variables/functions that YOUR changes made unused.
-- Don't remove pre-existing dead code unless asked.
-
-The test: Every changed line should trace directly to the user's request.
-
-## 4. Goal-Driven Execution
-
-**Define success criteria. Loop until verified.**
-
-Transform tasks into verifiable goals:
-- "Add validation" → "Write tests for invalid inputs, then make them pass"
-- "Fix the bug" → "Write a test that reproduces it, then make it pass"
-- "Refactor X" → "Ensure tests pass before and after"
-
-For multi-step tasks, state a brief plan:
-```
-1. [Step] → verify: [check]
-2. [Step] → verify: [check]
-3. [Step] → verify: [check]
-```
-
-Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
-
----
-
-**These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
+- Format changed Go files with `gofmt -w <paths>`.
+- Run `go test ./...` and `go vet ./...` for Go changes. Add focused regression tests using the existing Go test conventions.
+- Use `make build` when checking release builds across the supported platforms.
+- Choose live checks based on the changed behavior and report which DNS, TLS, HTTP/2, or ASN paths were exercised.
