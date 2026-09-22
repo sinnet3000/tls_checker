@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"os"
 	"os/exec"
 	"strings"
@@ -35,7 +36,8 @@ func TestMain_NoTargets_ExitsNonZero(t *testing.T) {
 		t.Fatalf("write input: %v", err)
 	}
 
-	cmd := exec.Command("go", "run", ".", "-i", inputPath, "--no-asn", "-t", "1", "--timeout", "1s", "--retries", "0")
+	cmd := exec.Command(os.Args[0], "-test.run=TestHelperProcess", "--", "-i", inputPath, "--no-asn", "-t", "1", "--timeout", "1s", "--retries", "0")
+	cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1")
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		t.Fatalf("expected non-zero exit, got success. output=%s", string(out))
@@ -43,6 +45,22 @@ func TestMain_NoTargets_ExitsNonZero(t *testing.T) {
 	if !strings.Contains(string(out), "fatal: no hosts to check") {
 		t.Fatalf("expected fatal message, got output=%s", string(out))
 	}
+}
+
+func TestHelperProcess(t *testing.T) {
+	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
+		return
+	}
+	var appArgs []string
+	for i, arg := range os.Args {
+		if arg == "--" {
+			appArgs = os.Args[i+1:]
+			break
+		}
+	}
+	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+	os.Args = append([]string{"tls_checker"}, appArgs...)
+	main()
 }
 
 func TestLoadHosts(t *testing.T) {
