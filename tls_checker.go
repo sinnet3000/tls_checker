@@ -583,7 +583,7 @@ func loadHosts(path, defaultPort string) ([]HostSpec, error) {
 	scanner := bufio.NewScanner(f)
 	// Allow reasonably long input lines (bufio.Scanner defaults to 64K).
 	scanner.Buffer(make([]byte, 1024), 1024*1024)
-	seen := make(map[string]struct{})
+	seen := make(map[HostSpec]struct{})
 	var targets []HostSpec
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -594,11 +594,10 @@ func loadHosts(path, defaultPort string) ([]HostSpec, error) {
 		if !ok {
 			continue
 		}
-		key := target.Host + ":" + target.Port
-		if _, dup := seen[key]; dup {
+		if _, dup := seen[target]; dup {
 			continue
 		}
-		seen[key] = struct{}{}
+		seen[target] = struct{}{}
 		targets = append(targets, target)
 	}
 	if err := scanner.Err(); err != nil {
