@@ -349,7 +349,9 @@ func (c *checker) diagnose(ctx context.Context, target HostSpec) (Result, error)
 	}
 
 	if !c.cfg.NoASN {
-		asn := c.queryASN(attemptCtx, ip)
+		asnCtx, cancelASN := context.WithTimeout(ctx, 3*time.Second)
+		defer cancelASN()
+		asn := c.queryASN(asnCtx, ip)
 		res.ASN, res.ASNName, res.ASNCountry, res.ASPrefix = asn.Number, asn.Name, asn.Country, asn.Prefix
 	}
 
