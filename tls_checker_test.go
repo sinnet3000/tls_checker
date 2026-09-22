@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"flag"
+	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -164,5 +166,44 @@ func TestH2Probe_BoundedRead(t *testing.T) {
 	ok := chk.h2Probe(context.Background(), target, u.Hostname(), false)
 	if !ok {
 		t.Fatalf("expected h2Probe to succeed on HTTP/2 server")
+	}
+}
+
+func TestIsRetryable(t *testing.T) {
+	if isRetryable(nil) {
+		t.Errorf("expected isRetryable(nil) to be false")
+	}
+
+	nxDomainErr := &net.DNSError{IsNotFound: true}
+	if isRetryable(nxDomainErr) {
+		t.Errorf("expected isRetryable(nxDomainErr) to be false")
+	}
+
+	wrappedNX := failure(ErrDNS, nxDomainErr)
+	if isRetryable(wrappedNX) {
+		t.Errorf("expected isRetryable(wrappedNX) to be false")
+	}
+
+	timeoutErr := &net.DNSError{IsTimeout: true}
+	if !isRetryable(timeoutErr) {
+		t.Errorf("expected isRetryable(timeoutErr) to be true")
+	}
+}
+
+func TestCheckHost_NoRetryOnNXDOMAIN(t *testing.T) {
+	chk := newChecker(Config{Retries: 3, Timeout: 1 * time.Second, NoASN: true}, log.Default())
+	target := HostSpec{Host: "nonexistent-domain-that-does-not-exist-12345.invalid", Port: "443"}
+	start := time.Now()
+	res := chk.checkHost(context.Background(), target)
+	elapsed := time.Since(start)
+
+	if res.Success {
+		t.Errorf("expected failure for nonexistent domain")
+	}
+	if res.RetriesUsed != 0 {
+		t.Errorf("expected 0 retries used for NXDOMAIN, got %d", res.RetriesUsed)
+	}
+	if elapsed > 3*time.Second {
+		t.Errorf("expected NXDOMAIN to fail fast without retries, took %v", elapsed)
 	}
 }

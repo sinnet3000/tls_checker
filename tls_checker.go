@@ -288,7 +288,7 @@ func (c *checker) checkHost(ctx context.Context, target HostSpec) Result {
 		res.RetriesUsed = attempt
 		res.Success = false
 		c.debugf("host=%s port=%s attempt=%d failed err=%v", target.Host, target.Port, attempt+1, err)
-		if attempt == c.cfg.Retries {
+		if attempt == c.cfg.Retries || !isRetryable(err) {
 			break
 		}
 		backoff := time.Second * time.Duration(1<<attempt)
@@ -693,6 +693,20 @@ func describeError(err error) string {
 		return string(ErrCert)
 	}
 	return string(ErrUnknown)
+}
+
+func isRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
+		return false
+	}
+	if strings.Contains(err.Error(), "no such host") {
+		return false
+	}
+	return true
 }
 
 func boolPtr(b *bool) string {
