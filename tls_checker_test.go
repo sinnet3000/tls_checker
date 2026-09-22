@@ -3,6 +3,9 @@ package main
 import (
 	"context"
 	"flag"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"strings"
@@ -104,5 +107,33 @@ example.com:8443
 		if targets[i] != exp {
 			t.Errorf("target[%d] = %+v, want %+v", i, targets[i], exp)
 		}
+	}
+}
+
+func TestDialTLS_SelfSignedCert(t *testing.T) {
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	u, err := url.Parse(ts.URL)
+	if err != nil {
+		t.Fatalf("parse test server url: %v", err)
+	}
+
+	chk := &checker{}
+	target := HostSpec{Host: u.Hostname(), Port: u.Port()}
+	state, _, tlsVer, certOK, err := chk.dialTLS(context.Background(), target, u.Hostname())
+	if err != nil {
+		t.Fatalf("dialTLS failed on self-signed cert: %v", err)
+	}
+	if certOK {
+		t.Fatalf("expected certOK to be false for self-signed cert without custom CA")
+	}
+	if tlsVer == "" {
+		t.Fatalf("expected non-empty TLS version")
+	}
+	if len(state.PeerCertificates) == 0 {
+		t.Fatalf("expected peer certificates to be present")
 	}
 }

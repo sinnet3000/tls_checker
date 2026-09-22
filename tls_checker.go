@@ -32,6 +32,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
@@ -321,7 +322,7 @@ func (c *checker) diagnose(ctx context.Context, target HostSpec) (Result, error)
 	c.debugf("host=%s port=%s resolved_ip=%s", target.Host, target.Port, ip)
 
 	start := time.Now()
-	state, alpn, tlsVer, certOK, err := c.dialTLSWithFallback(attemptCtx, target)
+	state, alpn, tlsVer, certOK, err := c.dialTLS(attemptCtx, target, ip)
 	if err != nil {
 		return res, failure(ErrTLS, err)
 	}
@@ -342,7 +343,7 @@ func (c *checker) diagnose(ctx context.Context, target HostSpec) (Result, error)
 	res.CertOK = certOK
 
 	if alpn == "h2" {
-		ok := c.h2Probe(attemptCtx, target, certOK)
+		ok := c.h2Probe(attemptCtx, target, ip, certOK)
 		res.H2OK = &ok
 		c.debugf("host=%s port=%s h2_probe=%t", target.Host, target.Port, ok)
 	}
@@ -375,14 +376,14 @@ func resolveOne(ctx context.Context, host string) (string, error) {
 	return ips[0].String(), nil
 }
 
-func (c *checker) dialTLS(ctx context.Context, target HostSpec, strict bool) (tls.ConnectionState, string, string, bool, error) {
+func (c *checker) dialTLS(ctx context.Context, target HostSpec, ip string) (tls.ConnectionState, string, string, bool, error) {
 	tlsCfg := &tls.Config{
 		ServerName:         target.Host,
 		NextProtos:         defaultALPN,
-		InsecureSkipVerify: !strict,
+		InsecureSkipVerify: true,
 	}
 	d := &tls.Dialer{NetDialer: &net.Dialer{}, Config: tlsCfg}
-	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(target.Host, target.Port))
+	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(ip, target.Port))
 	if err != nil {
 		return tls.ConnectionState{}, "", "", false, err
 	}
@@ -392,29 +393,41 @@ func (c *checker) dialTLS(ctx context.Context, target HostSpec, strict bool) (tl
 		return tls.ConnectionState{}, "", "", false, errors.New("not a TLS connection")
 	}
 	state := tlsConn.ConnectionState()
-	return state, state.NegotiatedProtocol, tlsVersionString(state.Version), strict, nil
+
+	certOK := false
+	if len(state.PeerCertificates) > 0 {
+		leaf := state.PeerCertificates[0]
+		opts := x509.VerifyOptions{
+			DNSName:       target.Host,
+			Intermediates: x509.NewCertPool(),
+		}
+		for _, cert := range state.PeerCertificates[1:] {
+			opts.Intermediates.AddCert(cert)
+		}
+		if _, err := leaf.Verify(opts); err == nil {
+			certOK = true
+		} else {
+			c.debugf("host=%s port=%s cert verification failed: %v", target.Host, target.Port, err)
+		}
+	}
+
+	return state, state.NegotiatedProtocol, tlsVersionString(state.Version), certOK, nil
 }
 
-func (c *checker) dialTLSWithFallback(ctx context.Context, target HostSpec) (tls.ConnectionState, string, string, bool, error) {
-	state, alpn, tlsVer, certOK, err := c.dialTLS(ctx, target, true)
-	if err == nil {
-		return state, alpn, tlsVer, certOK, nil
-	}
-	var verr *tls.CertificateVerificationError
-	if errors.As(err, &verr) {
-		c.debugf("host=%s port=%s strict TLS verify failed: %v (retrying insecure)", target.Host, target.Port, err)
-		return c.dialTLS(ctx, target, false)
-	}
-	return state, alpn, tlsVer, certOK, err
-}
-
-func (c *checker) h2Probe(ctx context.Context, target HostSpec, certOK bool) bool {
+func (c *checker) h2Probe(ctx context.Context, target HostSpec, ip string, certOK bool) bool {
 	tlsCfg := &tls.Config{
 		ServerName:         target.Host,
 		NextProtos:         []string{"h2"},
 		InsecureSkipVerify: !certOK,
 	}
-	client := &http.Client{Transport: &http2.Transport{TLSClientConfig: tlsCfg}, Timeout: c.cfg.Timeout}
+	tr := &http2.Transport{
+		TLSClientConfig: tlsCfg,
+		DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+			d := &tls.Dialer{NetDialer: &net.Dialer{}, Config: cfg}
+			return d.DialContext(ctx, network, net.JoinHostPort(ip, target.Port))
+		},
+	}
+	client := &http.Client{Transport: tr, Timeout: c.cfg.Timeout}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+net.JoinHostPort(target.Host, target.Port)+"/", nil)
 	if err != nil {
 		return false
