@@ -145,12 +145,12 @@ func TestH2Probe_BoundedRead(t *testing.T) {
 	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(http.StatusOK)
-		for i := 0; i < 100; i++ {
-			w.Write([]byte(strings.Repeat("A", 1024)))
-			if f, ok := w.(http.Flusher); ok {
-				f.Flush()
-			}
+		w.Write([]byte(strings.Repeat("A", h2ProbeMaxBodyBytes*2)))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
 		}
+		// Block to verify h2Probe does not wait for stream completion
+		<-r.Context().Done()
 	}))
 	ts.EnableHTTP2 = true
 	ts.StartTLS()
@@ -161,11 +161,17 @@ func TestH2Probe_BoundedRead(t *testing.T) {
 		t.Fatalf("parse test server url: %v", err)
 	}
 
-	chk := &checker{cfg: Config{Timeout: 3 * time.Second}}
+	chk := &checker{cfg: Config{Timeout: 5 * time.Second}}
 	target := HostSpec{Host: u.Hostname(), Port: u.Port()}
+	start := time.Now()
 	ok := chk.h2Probe(context.Background(), target, u.Hostname(), false)
+	elapsed := time.Since(start)
+
 	if !ok {
 		t.Fatalf("expected h2Probe to succeed on HTTP/2 server")
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("expected h2Probe to return promptly without waiting for stream, took %v", elapsed)
 	}
 }
 

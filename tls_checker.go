@@ -117,6 +117,8 @@ type checker struct {
 
 var defaultALPN = []string{"h2", "http/1.1"}
 
+const h2ProbeMaxBodyBytes = 4096
+
 type ErrorKind string
 
 const (
@@ -439,7 +441,7 @@ func (c *checker) h2Probe(ctx context.Context, target HostSpec, ip string, certO
 		return false
 	}
 	defer resp.Body.Close()
-	_, _ = io.CopyN(io.Discard, resp.Body, 4096)
+	_, _ = io.CopyN(io.Discard, resp.Body, h2ProbeMaxBodyBytes)
 	return resp.ProtoMajor == 2
 }
 
