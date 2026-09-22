@@ -320,11 +320,6 @@ func (c *checker) diagnose(ctx context.Context, target HostSpec) (Result, error)
 	res.IP = ip
 	c.debugf("host=%s port=%s resolved_ip=%s", target.Host, target.Port, ip)
 
-	if !c.cfg.NoASN {
-		asn := c.queryASN(attemptCtx, ip)
-		res.ASN, res.ASNName, res.ASNCountry, res.ASPrefix = asn.Number, asn.Name, asn.Country, asn.Prefix
-	}
-
 	start := time.Now()
 	state, alpn, tlsVer, certOK, err := c.dialTLSWithFallback(attemptCtx, target)
 	if err != nil {
@@ -350,6 +345,11 @@ func (c *checker) diagnose(ctx context.Context, target HostSpec) (Result, error)
 		ok := c.h2Probe(attemptCtx, target, certOK)
 		res.H2OK = &ok
 		c.debugf("host=%s port=%s h2_probe=%t", target.Host, target.Port, ok)
+	}
+
+	if !c.cfg.NoASN {
+		asn := c.queryASN(attemptCtx, ip)
+		res.ASN, res.ASNName, res.ASNCountry, res.ASPrefix = asn.Number, asn.Name, asn.Country, asn.Prefix
 	}
 
 	res.Success = true
