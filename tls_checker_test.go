@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestExtractHostIPv6Literal(t *testing.T) {
@@ -135,5 +136,33 @@ func TestDialTLS_SelfSignedCert(t *testing.T) {
 	}
 	if len(state.PeerCertificates) == 0 {
 		t.Fatalf("expected peer certificates to be present")
+	}
+}
+
+func TestH2Probe_BoundedRead(t *testing.T) {
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		for i := 0; i < 100; i++ {
+			w.Write([]byte(strings.Repeat("A", 1024)))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}
+	}))
+	ts.EnableHTTP2 = true
+	ts.StartTLS()
+	defer ts.Close()
+
+	u, err := url.Parse(ts.URL)
+	if err != nil {
+		t.Fatalf("parse test server url: %v", err)
+	}
+
+	chk := &checker{cfg: Config{Timeout: 3 * time.Second}}
+	target := HostSpec{Host: u.Hostname(), Port: u.Port()}
+	ok := chk.h2Probe(context.Background(), target, u.Hostname(), false)
+	if !ok {
+		t.Fatalf("expected h2Probe to succeed on HTTP/2 server")
 	}
 }

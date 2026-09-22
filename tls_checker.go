@@ -437,7 +437,7 @@ func (c *checker) h2Probe(ctx context.Context, target HostSpec, ip string, certO
 		return false
 	}
 	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
+	_, _ = io.CopyN(io.Discard, resp.Body, 4096)
 	return resp.ProtoMajor == 2
 }
 
