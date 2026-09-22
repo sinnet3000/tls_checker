@@ -198,7 +198,10 @@ func TestIsRetryable(t *testing.T) {
 
 func TestCheckHost_NoRetryOnNXDOMAIN(t *testing.T) {
 	chk := newChecker(Config{Retries: 3, Timeout: 1 * time.Second, NoASN: true}, log.Default())
-	target := HostSpec{Host: "nonexistent-domain-that-does-not-exist-12345.invalid", Port: "443"}
+	chk.resolve = func(ctx context.Context, host string) (string, error) {
+		return "", &net.DNSError{IsNotFound: true, Name: host}
+	}
+	target := HostSpec{Host: "nxdomain.example", Port: "443"}
 	start := time.Now()
 	res := chk.checkHost(context.Background(), target)
 	elapsed := time.Since(start)
@@ -209,7 +212,7 @@ func TestCheckHost_NoRetryOnNXDOMAIN(t *testing.T) {
 	if res.RetriesUsed != 0 {
 		t.Errorf("expected 0 retries used for NXDOMAIN, got %d", res.RetriesUsed)
 	}
-	if elapsed > 3*time.Second {
+	if elapsed > 1*time.Second {
 		t.Errorf("expected NXDOMAIN to fail fast without retries, took %v", elapsed)
 	}
 }

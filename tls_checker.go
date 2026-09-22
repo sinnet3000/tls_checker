@@ -113,6 +113,7 @@ type checker struct {
 	asnMu    sync.RWMutex
 	rng      *rand.Rand
 	rngMu    sync.Mutex
+	resolve  func(context.Context, string) (string, error)
 }
 
 var defaultALPN = []string{"h2", "http/1.1"}
@@ -226,6 +227,7 @@ func newChecker(cfg Config, logger *log.Logger) *checker {
 		debug:    dbg,
 		asnCache: make(map[string]ASNInfo),
 		rng:      rand.New(rand.NewSource(time.Now().UnixNano())),
+		resolve:  resolveOne,
 	}
 }
 
@@ -316,7 +318,11 @@ func (c *checker) diagnose(ctx context.Context, target HostSpec) (Result, error)
 		return res, errors.New("empty port")
 	}
 
-	ip, err := resolveOne(attemptCtx, target.Host)
+	resolveFn := c.resolve
+	if resolveFn == nil {
+		resolveFn = resolveOne
+	}
+	ip, err := resolveFn(attemptCtx, target.Host)
 	if err != nil {
 		return res, failure(ErrDNS, err)
 	}
