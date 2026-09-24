@@ -125,9 +125,7 @@ type ErrorKind string
 const (
 	ErrDNS     ErrorKind = "DNS_RESOLUTION_FAILED"
 	ErrTimeout ErrorKind = "CONNECTION_TIMEOUT"
-	ErrRefused ErrorKind = "CONNECTION_REFUSED"
 	ErrTLS     ErrorKind = "TLS_HANDSHAKE_FAILED"
-	ErrCert    ErrorKind = "CERT_VERIFICATION_FAILED"
 	ErrUnknown ErrorKind = "UNKNOWN_ERROR"
 )
 
@@ -694,13 +692,6 @@ func describeError(err error) string {
 	var ce *checkError
 	if errors.As(err, &ce) {
 		return string(ce.kind)
-	}
-	msg := err.Error()
-	switch {
-	case strings.Contains(msg, "refused"):
-		return string(ErrRefused)
-	case strings.Contains(msg, "certificate"):
-		return string(ErrCert)
 	}
 	return string(ErrUnknown)
 }
