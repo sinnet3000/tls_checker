@@ -31,7 +31,7 @@ cd tls_checker
 make install
 ```
 
-Requires **Go** 1.26.1 or newer. Installs to `~/.local/bin/`.
+Requires **Go** 1.26.11 or newer. Installs to `~/.local/bin/`.
 
 ---
 
