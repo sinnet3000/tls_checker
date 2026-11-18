@@ -46,8 +46,12 @@ find_install_dir() {
 download() {
     local url="$1"
     local output="$2"
+    case "$url" in
+        https://*) ;;
+        *) error "Refusing non-HTTPS download URL: $url" ;;
+    esac
     if command -v curl &>/dev/null; then
-        curl -fsSL "$url" -o "$output"
+        curl -fsSL --proto '=https' --proto-redir '=https' "$url" -o "$output"
     elif command -v wget &>/dev/null; then
         wget -q "$url" -O "$output"
     else
@@ -58,9 +62,64 @@ download() {
 get_latest_version() {
     local url="https://api.github.com/repos/${REPO}/releases/latest"
     if command -v curl &>/dev/null; then
-        curl -fsSL "$url" | grep '"tag_name"' | head -1 | cut -d'"' -f4
+        curl -fsSL --proto '=https' --proto-redir '=https' "$url" | grep '"tag_name"' | head -1 | cut -d'"' -f4
     elif command -v wget &>/dev/null; then
         wget -qO- "$url" | grep '"tag_name"' | head -1 | cut -d'"' -f4
+    fi
+}
+
+sha256_of_file() {
+    local file="$1"
+    local output
+    if command -v sha256sum &>/dev/null; then
+        output=$(sha256sum < "$file") || error "Could not compute SHA-256 for $file"
+    elif command -v shasum &>/dev/null; then
+        output=$(shasum -a 256 < "$file") || error "Could not compute SHA-256 for $file"
+    else
+        error "Neither sha256sum nor shasum found"
+    fi
+    printf '%s\n' "${output%%[[:space:]]*}"
+}
+
+verify_archive_checksum() {
+    local archive="$1"
+    local sums_file="$2"
+    local filename="$3"
+
+    [ -f "$sums_file" ] || error "SHA256SUMS is missing: $sums_file"
+    [ -r "$sums_file" ] || error "SHA256SUMS is not readable: $sums_file"
+    [ -f "$archive" ] || error "Release archive is missing: $archive"
+
+    local line lineno=0 expected_hash="" matches=0 entry_hash entry_name
+    while IFS= read -r line || [ -n "$line" ]; do
+        lineno=$((lineno + 1))
+        line="${line%$'\r'}"
+        [ -n "$line" ] || continue
+
+        if [[ ! "$line" =~ ^([0-9A-Fa-f]{64})[[:space:]]+\*?(.+)$ ]]; then
+            error "Malformed checksum entry on line ${lineno} of SHA256SUMS"
+        fi
+
+        entry_hash="${BASH_REMATCH[1]}"
+        entry_name="${BASH_REMATCH[2]}"
+        if [ "$entry_name" = "$filename" ]; then
+            matches=$((matches + 1))
+            expected_hash=$(printf '%s' "$entry_hash" | tr '[:upper:]' '[:lower:]')
+        fi
+    done < "$sums_file"
+
+    if [ "$matches" -eq 0 ]; then
+        error "No checksum entry for ${filename} in SHA256SUMS"
+    fi
+    if [ "$matches" -gt 1 ]; then
+        error "Duplicate checksum entries for ${filename} in SHA256SUMS"
+    fi
+
+    local actual_hash
+    actual_hash=$(sha256_of_file "$archive")
+    actual_hash=$(printf '%s' "$actual_hash" | tr '[:upper:]' '[:lower:]')
+    if [ "$actual_hash" != "$expected_hash" ]; then
+        error "Checksum verification failed for ${filename}"
     fi
 }
 
@@ -68,16 +127,18 @@ main() {
     info "Installing ${BINARY_NAME}..."
     echo
 
-    local os=$(detect_os)
-    local arch=$(detect_arch)
-    local install_dir=$(find_install_dir)
+    local os arch install_dir
+    os=$(detect_os)
+    arch=$(detect_arch)
+    install_dir=$(find_install_dir)
 
     info "Platform: ${os}/${arch}"
     info "Install directory: ${install_dir}"
     echo
 
     info "Fetching latest release..."
-    local ver=$(get_latest_version)
+    local ver
+    ver=$(get_latest_version)
 
     if [ -z "$ver" ]; then
         error "Could not determine latest version"
@@ -88,14 +149,26 @@ main() {
     local version="${ver#v}"
     local filename="${BINARY_NAME}_${version}_${os}_${arch}.tar.gz"
     local url="https://github.com/${REPO}/releases/download/${ver}/${filename}"
-
-    local tmpdir=$(mktemp -d)
-    trap "rm -rf $tmpdir" EXIT
+    local sums_url="https://github.com/${REPO}/releases/download/${ver}/SHA256SUMS"
+    local tmpdir sums_file
+    tmpdir=$(mktemp -d)
+    # Capture the shell-quoted path while tmpdir is still in scope.
+    # shellcheck disable=SC2064
+    trap "$(printf 'rm -rf -- %q' "$tmpdir")" EXIT
+    sums_file="$tmpdir/SHA256SUMS"
 
     info "Downloading ${filename}..."
     if ! download "$url" "$tmpdir/release.tar.gz"; then
         error "Download failed. Check https://github.com/${REPO}/releases for available binaries."
     fi
+
+    info "Downloading SHA256SUMS..."
+    if ! download "$sums_url" "$sums_file"; then
+        error "Could not download SHA256SUMS for ${ver}"
+    fi
+
+    info "Verifying checksum..."
+    verify_archive_checksum "$tmpdir/release.tar.gz" "$sums_file" "$filename"
 
     info "Extracting..."
     tar -xzf "$tmpdir/release.tar.gz" -C "$tmpdir"
@@ -126,4 +199,6 @@ main() {
     echo "  ${BINARY_NAME} -version    # show version"
 }
 
-main "$@"
+if [ "${BASH_SOURCE[0]:-$0}" = "$0" ]; then
+    main "$@"
+fi
