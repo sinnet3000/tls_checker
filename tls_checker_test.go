@@ -20,6 +20,90 @@ func TestDescribeErrorTimeoutWrapped(t *testing.T) {
 	}
 }
 
+func TestEscapeTerminal(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "plain", in: "example.com", want: "example.com"},
+		{name: "unicode", in: "café.example 日本語.example 😀", want: "café.example 日本語.example 😀"},
+		{name: "esc sequence", in: "red\x1b[31m", want: `red\x1b[31m`},
+		{name: "control characters", in: "a\x00b\ac\nd\re\tf\x7fg", want: `a\x00b\ac\nd\re\tf\x7fg`},
+		{name: "c1 control", in: "a\u0085b", want: `a\u0085b`},
+		{name: "bidi override", in: "a\u202eb", want: `a\u202eb`},
+		{name: "line separator", in: "a\u2028b", want: `a\u2028b`},
+		{name: "invalid utf8", in: "a\xffb", want: `a\xffb`},
+		{name: "backslash preserved", in: `a\b`, want: `a\b`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := escapeTerminal(tt.in); got != tt.want {
+				t.Fatalf("escapeTerminal(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFormatResultEscapesRemoteText(t *testing.T) {
+	h2OK := true
+	r := Result{
+		Host:       "host.example",
+		Port:       "443",
+		IP:         "203.0.113.10",
+		RTTms:      41,
+		ASN:        "13335",
+		ASNName:    "CLOUD\x1b[31mFLARE\r\nFAKE",
+		CommonName: "*.exa\x1b[2Jmple.com",
+		SANs:       []string{"good.example", "bad\a.example", "café.example", "日本語.example"},
+		TLSVersion: "TLS1.3",
+		ALPN:       "h2",
+		H2OK:       &h2OK,
+		CertOK:     true,
+		Success:    true,
+	}
+
+	out := formatResult(r)
+	for _, want := range []string{
+		`CN:*.exa\x1b[2Jmple.com`,
+		`SANs:[good.example, bad\a.example, café.example, ...]`,
+		`ASN:13335 (CLOUD\x1b[31mFLARE\r\nFAKE)`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected escaped field %q in output %q", want, out)
+		}
+	}
+	if got := strings.Count(out, " | "); got != 7 {
+		t.Errorf("expected output layout with 7 field separators, got %d in %q", got, out)
+	}
+	assertNoTerminalControls(t, out)
+}
+
+func TestFormatResultEscapesRemoteError(t *testing.T) {
+	r := Result{
+		Host:        "broken.example",
+		Port:        "443",
+		Error:       "dial tcp: \x1b[31mremote\a\nsecond line",
+		RetriesUsed: 2,
+	}
+
+	out := formatResult(r)
+	want := `❌ broken.example:443 - FAILED (Failed after 3 attempts: dial tcp: \x1b[31mremote\a\nsecond line)`
+	if out != want {
+		t.Fatalf("formatResult() = %q, want %q", out, want)
+	}
+	assertNoTerminalControls(t, out)
+}
+
+func assertNoTerminalControls(t *testing.T, s string) {
+	t.Helper()
+	for _, r := range s {
+		if isTerminalUnsafeRune(r) {
+			t.Fatalf("output contains raw unsafe rune %U: %q", r, s)
+		}
+	}
+}
+
 func TestLoadHosts(t *testing.T) {
 	tmp := t.TempDir()
 	inputPath := tmp + "/hosts.txt"

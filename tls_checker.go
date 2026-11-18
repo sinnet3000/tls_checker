@@ -50,6 +50,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/net/http2"
 	"golang.org/x/sync/errgroup"
@@ -138,7 +139,7 @@ func (c *checker) debugf(format string, args ...interface{}) {
 	if c == nil || c.debug == nil {
 		return
 	}
-	c.debug.Printf(format, args...)
+	c.debug.Print(escapeTerminal(fmt.Sprintf(format, args...)))
 }
 
 func (e *checkError) Error() string {
@@ -260,7 +261,7 @@ func (c *checker) runChecks(ctx context.Context, targets []HostSpec) []Result {
 		})
 	}
 	if err := g.Wait(); err != nil && !errors.Is(err, context.Canceled) {
-		c.logger.Printf("checks terminated early: %v", err)
+		c.logger.Printf("checks terminated early: %s", escapeTerminal(err.Error()))
 	}
 	sort.Slice(results, func(i, j int) bool {
 		if results[i].Host == results[j].Host {
@@ -494,6 +495,50 @@ func (c *checker) queryASN(ctx context.Context, ip string) ASNInfo {
 	return info
 }
 
+// escapeTerminal makes text from remote peers safe to print to a terminal.
+// Control and other layout-altering runes are shown as escape sequences, while
+// printable Unicode is left unchanged so names and output columns stay readable.
+func escapeTerminal(s string) string {
+	if s == "" {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 {
+			fmt.Fprintf(&b, `\x%02x`, s[i])
+			i++
+			continue
+		}
+		i += size
+		if !isTerminalUnsafeRune(r) {
+			b.WriteRune(r)
+			continue
+		}
+		quoted := strconv.QuoteRune(r)
+		b.WriteString(quoted[1 : len(quoted)-1])
+	}
+	return b.String()
+}
+
+// isTerminalUnsafeRune reports whether r can alter terminal output instead of
+// rendering as a visible character. C0/C1 controls, DEL, bidi overrides, and
+// Unicode line separators are escaped; ordinary printable Unicode is not.
+func isTerminalUnsafeRune(r rune) bool {
+	if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
+		return true
+	}
+	switch r {
+	case '\u061c', '\u200e', '\u200f', '\u2028', '\u2029',
+		'\u202a', '\u202b', '\u202c', '\u202d', '\u202e',
+		'\u2066', '\u2067', '\u2068', '\u2069':
+		return true
+	default:
+		return false
+	}
+}
+
 func formatResult(r Result) string {
 	endpoint := r.Host
 	if r.Port != "" {
@@ -536,16 +581,16 @@ func formatResult(r Result) string {
 	}
 	if r.Success {
 		_, icon := classify(&r)
-		return fmt.Sprintf("%s %s (%s) - RTT:%s | CN:%s | SANs:[%s] | ASN:%s (%s) | TLS:%s | ALPN:%s | H2:%s | Cert:%s%s",
+		return escapeTerminal(fmt.Sprintf("%s %s (%s) - RTT:%s | CN:%s | SANs:[%s] | ASN:%s (%s) | TLS:%s | ALPN:%s | H2:%s | Cert:%s%s",
 			icon, endpoint, val(r.IP, "N/A"), rtt, val(r.CommonName, "N/A"), strings.Join(sans, ", "),
 			val(r.ASN, "N/A"), val(r.ASNName, "N/A"), val(r.TLSVersion, "N/A"), val(r.ALPN, "none"), h2, cert, retry,
-		)
+		))
 	}
 	note := r.Error
 	if r.RetriesUsed > 0 {
-		note = fmt.Sprintf("Failed after %d attempts: %s", r.RetriesUsed+1, r.Error)
+		note = fmt.Sprintf("Failed after %d attempts: %s", r.RetriesUsed+1, note)
 	}
-	return fmt.Sprintf("❌ %s - FAILED (%s)", endpoint, note)
+	return escapeTerminal(fmt.Sprintf("❌ %s - FAILED (%s)", endpoint, note))
 }
 
 func printSummary(results []Result, total int, logger *log.Logger) {
@@ -576,7 +621,7 @@ func printSummary(results []Result, total int, logger *log.Logger) {
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
-			logger.Printf("  - %s: %d", k, breakdown[k])
+			logger.Printf("  - %s: %d", escapeTerminal(k), breakdown[k])
 		}
 	}
 	logger.Println(strings.Repeat("-", 49))
